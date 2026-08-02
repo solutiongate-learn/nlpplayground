@@ -79,21 +79,20 @@ st.set_page_config(
 
 CUSTOM_CSS = """
 <style>
-    /* Hero banner */
-    .hero {
-        background: linear-gradient(135deg, #6C63FF 0%, #3B82F6 100%);
-        padding: 2rem 2rem;
-        border-radius: 16px;
-        color: white;
-        margin-bottom: 1.5rem;
+    /* Page title — plain text, no card/gradient box. (Previously this was a
+       purple gradient banner; removed per explicit request — it read as an
+       unnecessary decorative box rather than a real design choice.) */
+    .page-title {
+        margin-bottom: 1.2rem;
     }
-    .hero h1 {
-        font-size: 2.1rem;
-        margin-bottom: 0.3rem;
+    .page-title h1 {
+        font-size: 2rem;
+        margin-bottom: 0.2rem;
+        color: inherit;
     }
-    .hero p {
+    .page-title p {
         font-size: 1.05rem;
-        opacity: 0.92;
+        opacity: 0.7;
         margin: 0;
     }
 
@@ -216,9 +215,8 @@ CUSTOM_CSS = """
 
     /* Mobile */
     @media (max-width: 768px) {
-        .hero { padding: 1.4rem 1.2rem; }
-        .hero h1 { font-size: 1.5rem; }
-        .hero p { font-size: 0.9rem; }
+        .page-title h1 { font-size: 1.5rem; }
+        .page-title p { font-size: 0.9rem; }
         .module-head h2 { font-size: 1.35rem; }
         .mobile-hint {
             display: block;
@@ -929,7 +927,7 @@ def clean_text(text: str) -> str:
 # ---------------------------------------------------------------------------
 st.markdown(
     """
-    <div class="hero">
+    <div class="page-title">
         <h1>🧠 NLPPlayground</h1>
         <p>Learn Python, R &amp; NLP by writing, running, and seeing real code — no setup required.</p>
     </div>
