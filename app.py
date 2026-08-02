@@ -337,6 +337,7 @@ def render_overview():
          "The same tasks in a modern, model-based library — built for comparison."),
     ]
     for icon, name, level, meta, who in steps:
+        track_key = f"{icon} {name}"
         with st.container(border=True):
             a, b = st.columns([3, 1])
             with a:
@@ -346,6 +347,12 @@ def render_overview():
                 st.caption("· ".join(l.split(" ", 1)[1] for l in meta["lessons"]))
             with b:
                 st.metric("Lessons", len(meta["lessons"]))
+            if st.button(f"Start {name} →", key=f"overview_start_{track_key}", use_container_width=True):
+                st.session_state["pending_nav_language"] = "🐍 Python"
+                st.session_state["pending_nav_mode"] = "🎓 Guided Learning"
+                st.session_state["pending_nav_track"] = track_key
+                st.session_state[f"pending_nav_lesson_{track_key}"] = meta["lessons"][0]
+                st.rerun()
 
     st.markdown("### ⚡ Or skip the lessons")
     t1, t2 = st.columns(2)
@@ -358,6 +365,9 @@ def render_overview():
                 "recognition and a step-by-step preprocessing pipeline on it. "
                 "NLTK and spaCy results shown side by side."
             )
+            if st.button("Open Quick Tools →", key="overview_start_quicktools", use_container_width=True):
+                st.session_state["pending_nav_mode"] = "⚡ Quick Tools"
+                st.rerun()
     with t2:
         with st.container(border=True):
             st.markdown("**Ⓡ R reference track**")
@@ -366,6 +376,10 @@ def render_overview():
                 "precomputed rather than live — this app runs on Python. Useful as a "
                 "reference; Python is the interactive path."
             )
+            if st.button("Open R track →", key="overview_start_r", use_container_width=True):
+                st.session_state["pending_nav_language"] = "Ⓡ R"
+                st.session_state["pending_nav_mode"] = "🎓 Guided Learning"
+                st.rerun()
 
     st.info(
         "💡 **Not sure where to start?** If you've never written code, go to "
@@ -544,12 +558,21 @@ st.markdown(
 # so two levels of the same hierarchy appeared in two different places.
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    # Apply any pending jumps requested by buttons elsewhere on the page (the
+    # Start Here cards, Previous/Next, etc.) BEFORE the widgets below are
+    # instantiated — Streamlit forbids writing to a widget's key afterwards.
+    for _key in ("nav_language", "nav_mode", "nav_track"):
+        _pending = st.session_state.pop(f"pending_{_key}", None)
+        if _pending is not None:
+            st.session_state[_key] = _pending
+
     st.markdown("### 💬 Language")
     language = st.radio(
         "Language track",
         ["🐍 Python", "Ⓡ R"],
         horizontal=True,
         label_visibility="collapsed",
+        key="nav_language",
     )
     if language == "Ⓡ R":
         st.caption(
@@ -562,6 +585,7 @@ with st.sidebar:
         "Choose your path",
         ["🏠 Start Here", "🎓 Guided Learning", "⚡ Quick Tools", "ℹ️ About"],
         label_visibility="collapsed",
+        key="nav_mode",
     )
 
     # --- Lesson navigator: only shown when it is actually relevant ---
