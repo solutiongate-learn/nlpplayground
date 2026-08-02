@@ -68,11 +68,155 @@ def get_spacy_model():
         return None, False
 
 # ---------------------------------------------------------------------------
+# USAGE ANALYTICS (optional, fails silently if not configured)
+#
+# Design notes (so future edits don't accidentally break this):
+#
+# - Streamlit Community Cloud's local filesystem is EPHEMERAL. It resets on
+#   every redeploy and on periodic container restarts. Anything written to a
+#   local file or SQLite DB here will eventually disappear. To get numbers
+#   that persist across restarts, we log events to a Google Sheet instead —
+#   free, no server to run, and the user (Sudhanshu) can open it directly.
+#
+# - This entire block is OPTIONAL. If `st.secrets["gcp_service_account"]`
+#   isn't configured (e.g. running locally without setting it up, or a fresh
+#   clone), every function below degrades to a harmless no-op. Analytics
+#   must never be able to crash the learning app for a real learner — that
+#   would be a much worse outcome than losing a few log rows.
+#
+# - "Time spent" here is an ESTIMATE, not a precise measurement: it's the gap
+#   between a session's first logged event and its most recent one. Streamlit
+#   has no heartbeat/ping while a tab sits open with no interaction, so a
+#   learner who opens a tab and reads quietly for 10 minutes without
+#   clicking anything will not show 10 minutes of "time spent" — only actual
+#   interaction gaps are visible. This estimate should be labeled as such
+#   anywhere it's displayed, not presented as an exact figure.
+#
+# - Event log schema (one row per event, one flat sheet, easy to pandas
+#   groupby): timestamp_utc, date, hour, session_id, event_type, detail
+#     - event_type "session_start": once per new session_id
+#     - event_type "page_view": logged whenever language/mode/track/lesson
+#       navigation actually changes (not on every single rerun/widget tweak,
+#       to avoid flooding the sheet)
+#     - event_type "heartbeat": a lightweight "still here" ping logged
+#       alongside page_view events, used only to compute the last-seen
+#       timestamp for the time-spent estimate
+# ---------------------------------------------------------------------------
+import datetime as _dt
+import uuid as _uuid
+
+ANALYTICS_SHEET_NAME = "NLPPlayground Analytics"
+ANALYTICS_WORKSHEET = "events"
+
+
+def _safe_secret(key, default=None):
+    """Reads one key from st.secrets without ever raising.
+
+    st.secrets.get()/`in` both raise StreamlitSecretNotFoundError (not
+    KeyError) when there is no secrets.toml file on disk AT ALL — which is
+    the normal, expected state for local dev or a fresh clone that hasn't
+    set up analytics yet. A plain dict-like .get() would silently swallow a
+    missing KEY but not a missing FILE, so we wrap this explicitly to
+    guarantee analytics/admin-view code never crashes the app either way.
+    """
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+@st.cache_resource(show_spinner=False)
+def _get_analytics_worksheet():
+    """Returns a gspread Worksheet, or None if analytics isn't configured.
+
+    Cached as a resource so we only authenticate once per app instance, not
+    on every single rerun (every widget interaction reruns the whole script).
+    """
+    try:
+        creds_dict_raw = _safe_secret("gcp_service_account")
+        if not creds_dict_raw:
+            return None
+        import gspread
+        creds_dict = dict(creds_dict_raw)
+        gc = gspread.service_account_from_dict(creds_dict)
+        sh = gc.open(ANALYTICS_SHEET_NAME)
+        try:
+            ws = sh.worksheet(ANALYTICS_WORKSHEET)
+        except Exception:
+            # First run — sheet exists but the "events" tab doesn't yet.
+            ws = sh.add_worksheet(title=ANALYTICS_WORKSHEET, rows=1000, cols=6)
+            ws.append_row(
+                ["timestamp_utc", "date", "hour", "session_id", "event_type", "detail"]
+            )
+        return ws
+    except Exception:
+        # Analytics must never break the app for a real learner. Any
+        # misconfiguration (missing sheet, revoked access, bad credentials,
+        # network hiccup) just silently disables logging for this session.
+        return None
+
+
+def _log_event(event_type, detail=""):
+    """Append one row to the analytics sheet. No-ops safely if unconfigured."""
+    ws = _get_analytics_worksheet()
+    if ws is None:
+        return
+    try:
+        now = _dt.datetime.utcnow()
+        ws.append_row(
+            [
+                now.isoformat(timespec="seconds") + "Z",
+                now.strftime("%Y-%m-%d"),
+                now.strftime("%H"),
+                st.session_state.get("_analytics_session_id", ""),
+                event_type,
+                detail,
+            ]
+        )
+    except Exception:
+        pass  # network hiccups, rate limits, etc. — never crash on this
+
+
+def track_session_and_page(language, mode, track, lesson_label):
+    """Call once per rerun from the main script body. Cheap no-op if the
+    navigation state hasn't actually changed since the last rerun, so we
+    don't flood the sheet with a row on every keystroke inside a text box.
+    """
+    if "_analytics_session_id" not in st.session_state:
+        st.session_state["_analytics_session_id"] = _uuid.uuid4().hex[:12]
+        _log_event("session_start")
+
+    nav_fingerprint = f"{language} | {mode} | {track or ''} | {lesson_label or ''}"
+    if st.session_state.get("_analytics_last_nav") != nav_fingerprint:
+        st.session_state["_analytics_last_nav"] = nav_fingerprint
+        _log_event("page_view", nav_fingerprint)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_analytics_events():
+    """Reads the full event log as a DataFrame for the admin view.
+    Cached for 30s so the admin view doesn't hammer the Sheets API on every
+    rerun while you're looking at it.
+    """
+    ws = _get_analytics_worksheet()
+    if ws is None:
+        return None
+    try:
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame(
+                columns=["timestamp_utc", "date", "hour", "session_id", "event_type", "detail"]
+            )
+        return pd.DataFrame(records)
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
 # Page config + styling
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="NLPPlayground",
-    page_icon="🧠",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -249,6 +393,114 @@ CUSTOM_CSS = """
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# HIDDEN ADMIN VIEW — usage analytics dashboard
+#
+# Only reachable via a secret URL query param (?admin=1) AND a password
+# check against st.secrets — never appears in the sidebar nav, so ordinary
+# learners never see it or know it exists. If it's not configured (no
+# secrets set), this whole block is skipped and the app behaves exactly as
+# before. This MUST run before the sidebar/nav below so it can render its
+# own standalone page and st.stop() without touching normal app state.
+# ---------------------------------------------------------------------------
+if st.query_params.get("admin") == "1":
+    st.title("NLPPlayground — Usage Dashboard")
+    st.caption("Hidden admin view. Not linked from anywhere in the app's navigation.")
+
+    _admin_secret = _safe_secret("admin_password")
+    if not _admin_secret:
+        st.error(
+            "Admin dashboard isn't configured yet. Add an `admin_password` value "
+            "to this app's Streamlit secrets to enable it."
+        )
+        st.stop()
+
+    _entered = st.text_input("Admin password", type="password", key="_admin_pw")
+    if _entered != _admin_secret:
+        if _entered:
+            st.error("Incorrect password.")
+        st.stop()
+
+    st.success("Authenticated.")
+    _events_df = load_analytics_events()
+
+    if _events_df is None:
+        st.warning(
+            "Analytics isn't configured (or the Google Sheet isn't reachable). "
+            "See ANALYTICS-SETUP.md for setup steps. No events have been logged."
+        )
+        st.stop()
+
+    if _events_df.empty:
+        st.info("Analytics is configured, but no events have been logged yet.")
+        st.stop()
+
+    # --- Derive per-session summaries (session_start -> most recent event) ---
+    _events_df["timestamp_utc"] = pd.to_datetime(_events_df["timestamp_utc"], errors="coerce")
+    _events_df = _events_df.dropna(subset=["timestamp_utc"])
+
+    _sessions = (
+        _events_df.groupby("session_id")["timestamp_utc"]
+        .agg(first_seen="min", last_seen="max")
+        .reset_index()
+    )
+    _sessions["est_minutes"] = (
+        (_sessions["last_seen"] - _sessions["first_seen"]).dt.total_seconds() / 60
+    ).round(1)
+
+    total_sessions = len(_sessions)
+    total_page_views = int((_events_df["event_type"] == "page_view").sum())
+    avg_minutes = round(_sessions["est_minutes"].mean(), 1) if total_sessions else 0.0
+    median_minutes = round(_sessions["est_minutes"].median(), 1) if total_sessions else 0.0
+
+    st.markdown("### Headline numbers")
+    st.caption(
+        "\"Time spent\" is an ESTIMATE — the gap between a session's first and "
+        "most recent logged interaction. Streamlit has no way to detect a tab "
+        "sitting open with no clicks, so quiet reading time between "
+        "interactions is not visible here. Treat these as directional, not exact."
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total sessions", total_sessions)
+    m2.metric("Total page views", total_page_views)
+    m3.metric("Avg. est. time/session", f"{avg_minutes} min")
+    m4.metric("Median est. time/session", f"{median_minutes} min")
+
+    st.markdown("---")
+    st.markdown("### Sessions by day")
+    _by_day = _events_df[_events_df["event_type"] == "session_start"]["date"].value_counts().sort_index()
+    if not _by_day.empty:
+        st.bar_chart(_by_day)
+    else:
+        st.caption("No session_start events yet.")
+
+    st.markdown("### Page views by hour of day (UTC)")
+    _by_hour = _events_df[_events_df["event_type"] == "page_view"]["hour"].value_counts().sort_index()
+    if not _by_hour.empty:
+        st.bar_chart(_by_hour)
+    else:
+        st.caption("No page_view events yet.")
+
+    st.markdown("### Most-viewed pages/lessons")
+    _top_pages = (
+        _events_df[_events_df["event_type"] == "page_view"]["detail"]
+        .value_counts()
+        .head(20)
+    )
+    if not _top_pages.empty:
+        st.dataframe(_top_pages.rename("views"), use_container_width=True)
+    else:
+        st.caption("No page_view events yet.")
+
+    with st.expander("Raw event log (most recent 500 rows)"):
+        st.dataframe(
+            _events_df.sort_values("timestamp_utc", ascending=False).head(500),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Sample dataset (small, bundled inline so there is zero setup friction)
@@ -434,17 +686,17 @@ def render_multi_doc_picker(key_prefix: str):
     source = st.radio(
         "Multi-document corpus",
         [
-            "🏛️ US Inaugural Addresses (60 speeches, 1789–2025, public domain)",
-            "📚 Gutenberg books (18 novels/texts, opening portion, public domain)",
-            "📁 Upload your own files",
+            "US Inaugural Addresses (60 speeches, 1789–2025, public domain)",
+            "Gutenberg books (18 novels/texts, opening portion, public domain)",
+            "Upload your own files",
         ],
         key=f"{key_prefix}_source",
     )
 
-    if source.startswith("🏛️"):
+    if source.startswith("US Inaugural"):
         return load_inaugural_corpus()
 
-    if source.startswith("📚"):
+    if source.startswith("Gutenberg"):
         return load_gutenberg_corpus()
 
     # --- Upload path ---
@@ -505,13 +757,13 @@ def render_document_boxes(key_prefix: str):
     cols = st.columns(2)
     for i in range(DOC_BOX_COUNT):
         with cols[i % 2]:
-            with st.expander(f"📄 Document {i + 1}", expanded=(i < 2)):
+            with st.expander(f"Document {i + 1}", expanded=(i < 2)):
                 input_mode = st.radio(
-                    "Input type", ["✍️ Type text", "📁 Upload PDF"],
+                    "Input type", ["Type text", "Upload PDF"],
                     horizontal=True, key=f"{key_prefix}_mode_{i}",
                     label_visibility="collapsed",
                 )
-                if input_mode == "📁 Upload PDF":
+                if input_mode == "Upload PDF":
                     up = st.file_uploader(
                         "PDF", type=["pdf"], key=f"{key_prefix}_pdf_{i}",
                         label_visibility="collapsed",
@@ -536,7 +788,7 @@ def render_document_boxes(key_prefix: str):
 
     non_empty = sum(1 for t in box_texts if t)
     analyze = st.button(
-        f"🔄 Analyze ({non_empty} of {DOC_BOX_COUNT} documents have text)",
+        f"Analyze ({non_empty} of {DOC_BOX_COUNT} documents have text)",
         key=f"{key_prefix}_analyze", type="primary",
     )
 
@@ -597,7 +849,7 @@ def render_shared_text_editor():
         elif widget_key not in st.session_state:
             st.session_state[widget_key] = default
 
-    with st.expander("✏️ Edit the shared example text (used by every lesson below)"):
+    with st.expander("Edit the shared example text (used by every lesson below)"):
         st.caption(
             "Both the NLTK and spaCy tracks use the **same** text for every lesson, so any "
             "differences you see are genuine library differences — not caused by different "
@@ -610,7 +862,7 @@ def render_shared_text_editor():
                 "Tokens example", height=120, key="shared_text_tokens_box",
                 label_visibility="collapsed",
             )
-            if st.button("🔄 Reset to default", key="reset_tokens_text"):
+            if st.button("Reset to default", key="reset_tokens_text"):
                 st.session_state["pending_shared_text_tokens_box"] = SHARED_TEXT_TOKENS_DEFAULT
                 st.rerun()
         with c2:
@@ -619,7 +871,7 @@ def render_shared_text_editor():
                 "Entities example", height=120, key="shared_text_entities_box",
                 label_visibility="collapsed",
             )
-            if st.button("🔄 Reset to default", key="reset_entities_text"):
+            if st.button("Reset to default", key="reset_entities_text"):
                 st.session_state["pending_shared_text_entities_box"] = SHARED_TEXT_ENTITIES_DEFAULT
                 st.rerun()
 
@@ -635,13 +887,13 @@ def render_shared_text_editor():
 # tools shipped and the landing page kept advertising the old number.
 # ---------------------------------------------------------------------------
 QUICK_TOOLS = [
-    "🔧 Preprocessing Pipeline",
-    "😊 Sentiment Analysis",
-    "🔑 Keyword Extraction",
-    "🏷️ Named Entity Recognition",
-    "☁️ Word Cloud",
-    "🧪 Classification",
-    "🔬 Clustering",
+    "Preprocessing Pipeline",
+    "Sentiment Analysis",
+    "Keyword Extraction",
+    "Named Entity Recognition",
+    "Word Cloud",
+    "Classification",
+    "Clustering",
 ]
 
 # ---------------------------------------------------------------------------
@@ -654,57 +906,57 @@ QUICK_TOOLS = [
 # which is what caused the StreamlitDuplicateElementId bug earlier.
 # ---------------------------------------------------------------------------
 PY_TRACKS = {
-    "🧱 Fundamentals": {
+    "Fundamentals": {
         "blurb": "Zero assumptions. Everything you need before touching NLP.",
         "level": "Beginner",
         "lessons": [
-            "0️⃣ What is Python?", "1️⃣ Variables & Types", "2️⃣ Strings & Text",
-            "3️⃣ Lists & Loops", "4️⃣ Conditionals", "5️⃣ Functions",
-            "6️⃣ Dictionaries", "7️⃣ DataFrames",
+            "0 What is Python?", "1 Variables & Types", "2 Strings & Text",
+            "3 Lists & Loops", "4 Conditionals", "5 Functions",
+            "6 Dictionaries", "7 DataFrames",
         ],
     },
-    "🧰 Working with Text Data": {
+    "Working with Text Data": {
         "blurb": "Real text lives in files, in odd encodings, inside PDFs. Bridge module.",
         "level": "Intermediate",
         "lessons": [
-            "0️⃣ Reading & Writing Files", "1️⃣ Encodings", "2️⃣ Regular Expressions",
-            "3️⃣ Cleaning Text", "4️⃣ Text in pandas", "5️⃣ Reading PDFs",
-            "6️⃣ Errors & Debugging",
+            "0 Reading & Writing Files", "1 Encodings", "2 Regular Expressions",
+            "3 Cleaning Text", "4 Text in pandas", "5 Reading PDFs",
+            "6 Errors & Debugging",
         ],
     },
-    "📚 NLTK": {
+    "NLTK": {
         "blurb": "The classic, rule-based toolkit. See how NLP works under the hood.",
         "level": "NLP",
         "lessons": [
-            "0️⃣ Tokenization", "1️⃣ Stopwords", "2️⃣ Stemming",
-            "3️⃣ POS Tagging", "4️⃣ NER", "5️⃣ Sentiment (VADER)",
-            "6️⃣ Keyword Extraction", "7️⃣ Word Cloud",
-            "8️⃣ Frequency Distributions",
+            "0 Tokenization", "1 Stopwords", "2 Stemming",
+            "3 POS Tagging", "4 NER", "5 Sentiment (VADER)",
+            "6 Keyword Extraction", "7 Word Cloud",
+            "8 Frequency Distributions",
         ],
     },
-    "⚡ spaCy": {
+    "spaCy": {
         "blurb": "The modern, model-based library. Same tasks, different tradeoffs.",
         "level": "NLP",
         "lessons": [
-            "0️⃣ Tokenization", "1️⃣ Stopwords", "2️⃣ Lemmatization",
-            "3️⃣ POS Tagging", "4️⃣ NER", "5️⃣ Dependency Parsing",
-            "6️⃣ Sentiment", "7️⃣ Keyword Extraction", "8️⃣ Word Cloud",
+            "0 Tokenization", "1 Stopwords", "2 Lemmatization",
+            "3 POS Tagging", "4 NER", "5 Dependency Parsing",
+            "6 Sentiment", "7 Keyword Extraction", "8 Word Cloud",
         ],
     },
-    "🧪 Classification & Clustering": {
+    "Classification & Clustering": {
         "blurb": "From counting words to machine learning: TF → TF-IDF → predicting labels → finding groups.",
         "level": "Machine Learning",
         "lessons": [
-            "0️⃣ Term Frequency (TF)", "1️⃣ TF-IDF (needs a corpus)",
-            "2️⃣ Naive Bayes Classification", "3️⃣ K-Means Clustering",
+            "0 Term Frequency (TF)", "1 TF-IDF (needs a corpus)",
+            "2 Naive Bayes Classification", "3 K-Means Clustering",
         ],
     },
 }
 
 R_LESSONS = [
-    "0️⃣ What is R?", "1️⃣ Variables & Types", "2️⃣ Strings & Text",
-    "3️⃣ Vectors & Loops", "4️⃣ Conditionals", "5️⃣ Functions",
-    "6️⃣ Named Lists", "7️⃣ Data Frames",
+    "0 What is R?", "1 Variables & Types", "2 Strings & Text",
+    "3 Vectors & Loops", "4 Conditionals", "5 Functions",
+    "6 Named Lists", "7 Data Frames",
 ]
 
 TOTAL_PY_LESSONS = sum(len(t["lessons"]) for t in PY_TRACKS.values())
@@ -717,7 +969,7 @@ def render_overview():
     else existed or how the modules related to each other.
     """
     st.markdown(
-        "<div class='card'>👋 <b>New here? This is the whole path.</b> Work top to bottom, "
+        "<div class='card'><b>New here? This is the whole path.</b> Work top to bottom, "
         "or jump straight to whatever you need — every module is reachable from the "
         "sidebar at any time.</div>",
         unsafe_allow_html=True,
@@ -728,17 +980,17 @@ def render_overview():
     c2.metric("Modules", len(PY_TRACKS))
     c3.metric("Interactive tools", len(QUICK_TOOLS))
 
-    st.markdown("### 🐍 The Python path")
+    st.markdown("### The Python path")
     steps = [
-        ("🧱", "Fundamentals", "Beginner", PY_TRACKS["🧱 Fundamentals"],
+        ("", "Fundamentals", "Beginner", PY_TRACKS["Fundamentals"],
          "Never written Python? Start here."),
-        ("🧰", "Working with Text Data", "Intermediate", PY_TRACKS["🧰 Working with Text Data"],
+        ("", "Working with Text Data", "Intermediate", PY_TRACKS["Working with Text Data"],
          "Comfortable with basics but never opened a file or hit an encoding error?"),
-        ("📚", "NLTK", "NLP", PY_TRACKS["📚 NLTK"],
+        ("", "NLTK", "NLP", PY_TRACKS["NLTK"],
          "Ready for NLP. The classic, rule-based toolkit."),
-        ("⚡", "spaCy", "NLP", PY_TRACKS["⚡ spaCy"],
+        ("", "spaCy", "NLP", PY_TRACKS["spaCy"],
          "The same tasks in a modern, model-based library — built for comparison."),
-        ("🧪", "Classification & Clustering", "Machine Learning", PY_TRACKS["🧪 Classification & Clustering"],
+        ("", "Classification & Clustering", "Machine Learning", PY_TRACKS["Classification & Clustering"],
          "TF → TF-IDF → predicting labels → finding groups, on 60 real inaugural addresses."),
     ]
     for icon, name, level, meta, who in steps:
@@ -753,17 +1005,17 @@ def render_overview():
             with b:
                 st.metric("Lessons", len(meta["lessons"]))
             if st.button(f"Start {name} →", key=f"overview_start_{track_key}", use_container_width=True):
-                st.session_state["pending_nav_language"] = "🐍 Python"
-                st.session_state["pending_nav_mode"] = "🎓 Guided Learning"
+                st.session_state["pending_nav_language"] = "Python"
+                st.session_state["pending_nav_mode"] = "Guided Learning"
                 st.session_state["pending_nav_track"] = track_key
                 st.session_state[f"pending_nav_lesson_{track_key}"] = meta["lessons"][0]
                 st.rerun()
 
-    st.markdown("### ⚡ Or skip the lessons")
+    st.markdown("### Or skip the lessons")
     t1, t2 = st.columns(2)
     with t1:
         with st.container(border=True):
-            st.markdown("**🔧 Quick Tools**")
+            st.markdown("**Quick Tools**")
             st.caption(
                 "Load your own text — paste, upload a .txt/.csv/.pdf, or pick a "
                 "public-domain classic — then run sentiment, keywords, entity "
@@ -771,47 +1023,47 @@ def render_overview():
                 "NLTK and spaCy results shown side by side."
             )
             if st.button("Open Quick Tools →", key="overview_start_quicktools", use_container_width=True):
-                st.session_state["pending_nav_mode"] = "⚡ Quick Tools"
+                st.session_state["pending_nav_mode"] = "Quick Tools"
                 st.rerun()
     with t2:
         with st.container(border=True):
-            st.markdown("**Ⓡ R reference track**")
+            st.markdown("**R reference track**")
             st.caption(
                 "Real, correct R code covering the same Fundamentals ground. Output is "
                 "precomputed rather than live — this app runs on Python. Useful as a "
                 "reference; Python is the interactive path."
             )
             if st.button("Open R track →", key="overview_start_r", use_container_width=True):
-                st.session_state["pending_nav_language"] = "Ⓡ R"
-                st.session_state["pending_nav_mode"] = "🎓 Guided Learning"
+                st.session_state["pending_nav_language"] = "R"
+                st.session_state["pending_nav_mode"] = "Guided Learning"
                 st.rerun()
 
     st.info(
-        "💡 **Not sure where to start?** If you've never written code, go to "
-        "**🎓 Guided Learning → 🧱 Fundamentals**. If you can already write a loop and "
-        "a function, start at **🧰 Working with Text Data**. If you just want to see NLP "
-        "do something, go straight to **⚡ Quick Tools**."
+        "**Not sure where to start?** If you've never written code, go to "
+        "**Guided Learning → Fundamentals**. If you can already write a loop and "
+        "a function, start at **Working with Text Data**. If you just want to see NLP "
+        "do something, go straight to **Quick Tools**."
     )
 
-    with st.expander("🗺️ Where everything fits in the NLP pipeline"):
+    with st.expander("Where everything fits in the NLP pipeline"):
         st.caption(
             "A real NLP/ML workflow has a shape: clean the text, turn it into numbers, "
             "then either predict a label or find groups. Every lesson and tool below maps "
             "onto one stage of that shape."
         )
         taxonomy = pd.DataFrame([
-            ("🧱 Fundamentals", "Foundations", "Python itself — no NLP yet"),
-            ("🧰 Working with Text Data", "Foundations", "Files, encodings, regex — getting real text INTO Python"),
-            ("📚 NLTK / ⚡ spaCy — Tokenization, Stopwords, Stemming/Lemmatization", "Preprocessing", "Cleaning and normalizing text"),
-            ("📚 NLTK / ⚡ spaCy — POS Tagging, NER, Dependency Parsing", "Feature Extraction", "Pulling structured information out of text"),
-            ("📚 NLTK — Frequency Distributions", "Descriptive Statistics", "FreqDist, most_common(), hapaxes — the numeric summary of a document's vocabulary"),
-            ("📚 NLTK — Sentiment (VADER)", "Classification-adjacent", "Rule-based label assignment, no training involved"),
-            ("🔧 Quick Tools — Preprocessing Pipeline", "Preprocessing", "The cleaning stage above, made visible and toggleable"),
-            ("🔑 Quick Tools — Keyword Extraction", "Feature Extraction", "Term Frequency (TF), informally"),
-            ("☁️ Quick Tools — Word Cloud", "Visualization", "A picture of Feature Extraction's output"),
-            ("🧪 Classification & Clustering — TF, TF-IDF", "Feature Extraction", "Turning text into numbers properly, with a real multi-document corpus"),
-            ("🧪 Classification & Clustering — Naive Bayes", "Classification", "Predicting a label (era) from learned examples"),
-            ("🧪 Classification & Clustering — K-Means", "Clustering", "Finding groups with no labels at all"),
+            ("Fundamentals", "Foundations", "Python itself — no NLP yet"),
+            ("Working with Text Data", "Foundations", "Files, encodings, regex — getting real text INTO Python"),
+            ("NLTK / spaCy — Tokenization, Stopwords, Stemming/Lemmatization", "Preprocessing", "Cleaning and normalizing text"),
+            ("NLTK / spaCy — POS Tagging, NER, Dependency Parsing", "Feature Extraction", "Pulling structured information out of text"),
+            ("NLTK — Frequency Distributions", "Descriptive Statistics", "FreqDist, most_common(), hapaxes — the numeric summary of a document's vocabulary"),
+            ("NLTK — Sentiment (VADER)", "Classification-adjacent", "Rule-based label assignment, no training involved"),
+            ("Quick Tools — Preprocessing Pipeline", "Preprocessing", "The cleaning stage above, made visible and toggleable"),
+            ("Quick Tools — Keyword Extraction", "Feature Extraction", "Term Frequency (TF), informally"),
+            ("Quick Tools — Word Cloud", "Visualization", "A picture of Feature Extraction's output"),
+            ("Classification & Clustering — TF, TF-IDF", "Feature Extraction", "Turning text into numbers properly, with a real multi-document corpus"),
+            ("Classification & Clustering — Naive Bayes", "Classification", "Predicting a label (era) from learned examples"),
+            ("Classification & Clustering — K-Means", "Clustering", "Finding groups with no labels at all"),
         ], columns=["Where", "Category", "What it actually does"])
         st.dataframe(taxonomy, use_container_width=True, hide_index=True)
 
@@ -858,10 +1110,10 @@ def code_and_output(code: str, render_output, key: str):
     """
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.caption("🐍 Python code")
+        st.caption("Python code")
         st.code(code, language="python")
         st.download_button(
-            "📥 Download this code",
+            "Download this code",
             data=code,
             file_name=f"{key}.py",
             mime="text/x-python",
@@ -869,7 +1121,7 @@ def code_and_output(code: str, render_output, key: str):
             key=f"dl_{key}",
         )
     with c2:
-        st.caption("📊 Output")
+        st.caption("Output")
         render_output()
 
 
@@ -881,10 +1133,10 @@ def code_and_output_r(code: str, render_output, key: str):
     """
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.caption("Ⓡ R code")
+        st.caption("R code")
         st.code(code, language="r")
         st.download_button(
-            "📥 Download this code",
+            "Download this code",
             data=code,
             file_name=f"{key}.R",
             mime="text/plain",
@@ -892,7 +1144,7 @@ def code_and_output_r(code: str, render_output, key: str):
             key=f"dl_{key}",
         )
     with c2:
-        st.caption("📊 Example output (precomputed)")
+        st.caption("Example output (precomputed)")
         st.caption("_This output isn't live-executed — run the code yourself in RStudio or Posit Cloud to experiment._")
         render_output()
 
@@ -907,11 +1159,11 @@ def render_r_practice_box(key: str, placeholder: str):
     shown elsewhere on the lesson is always the fixed, verified example.
     """
     st.text_area(
-        "✏️ Practice writing R code here",
+        "Practice writing R code here",
         value=placeholder, height=100, key=key,
     )
     st.caption(
-        "ℹ️ This box doesn't execute — this app runs on Python, so there's no R "
+        "This box doesn't execute — this app runs on Python, so there's no R "
         "interpreter here to run what you type. Use it to practice R syntax by writing "
         "it out; paste into RStudio, Posit Cloud, or an online R environment to see it "
         "actually run. The output above/below stays the verified example regardless."
@@ -985,7 +1237,7 @@ def clean_text(text: str) -> str:
 st.markdown(
     """
     <div class="page-title">
-        <h1>🧠 NLPPlayground</h1>
+        <h1>NLPPlayground</h1>
         <p>Learn Python, R &amp; NLP by writing, running, and seeing real code — no setup required.</p>
     </div>
     """,
@@ -994,7 +1246,7 @@ st.markdown(
 
 # Only rendered on narrow screens (see .mobile-hint in CSS above).
 st.markdown(
-    "<div class='mobile-hint'>📱 <b>On a phone?</b> Tap the <b>☰</b> menu at the top-left "
+    "<div class='mobile-hint'><b>On a phone?</b> Tap the <b>☰</b> menu at the top-left "
     "to choose a module and lesson. You can also move through lessons with the "
     "<b>Previous / Next</b> buttons at the bottom of each page — no menu needed.</div>",
     unsafe_allow_html=True,
@@ -1014,24 +1266,24 @@ with st.sidebar:
         if _pending is not None:
             st.session_state[_key] = _pending
 
-    st.markdown("### 💬 Language")
+    st.markdown("### Language")
     language = st.radio(
         "Language track",
-        ["🐍 Python", "Ⓡ R"],
+        ["Python", "R"],
         horizontal=True,
         label_visibility="collapsed",
         key="nav_language",
     )
-    if language == "Ⓡ R":
+    if language == "R":
         st.caption(
-            "📘 **Reference track** — real R code, precomputed output (this app runs on "
+            "**Reference track** — real R code, precomputed output (this app runs on "
             "Python). Fundamentals only."
         )
 
-    st.markdown("### 🧭 Where to")
+    st.markdown("### Where to")
     mode = st.radio(
         "Choose your path",
-        ["🏠 Start Here", "🎓 Guided Learning", "⚡ Quick Tools", "ℹ️ About"],
+        ["Start Here", "Guided Learning", "Quick Tools", "About"],
         label_visibility="collapsed",
         key="nav_mode",
     )
@@ -1039,10 +1291,10 @@ with st.sidebar:
     # --- Lesson navigator: only shown when it is actually relevant ---
     track = None
     lesson_idx = 0
-    if mode == "🎓 Guided Learning":
+    if mode == "Guided Learning":
         st.markdown("---")
-        if language == "🐍 Python":
-            st.markdown("### 📦 Module")
+        if language == "Python":
+            st.markdown("### Module")
             track = st.radio(
                 "Module",
                 list(PY_TRACKS.keys()),
@@ -1053,9 +1305,9 @@ with st.sidebar:
             lessons = PY_TRACKS[track]["lessons"]
             state_key = f"nav_lesson_{track}"
         else:
-            st.markdown("### 📦 Module")
+            st.markdown("### Module")
             st.caption("R covers Fundamentals only.")
-            track = "🧱 Fundamentals"
+            track = "Fundamentals"
             lessons = R_LESSONS
             state_key = "nav_lesson_r"
 
@@ -1071,7 +1323,7 @@ with st.sidebar:
         if st.session_state[state_key] not in lessons:
             st.session_state[state_key] = lessons[0]
 
-        st.markdown("### 📖 Lesson")
+        st.markdown("### Lesson")
         chosen_lesson = st.radio(
             "Lesson",
             lessons,
@@ -1084,21 +1336,28 @@ with st.sidebar:
         st.caption(f"Lesson {lesson_idx + 1} of {len(lessons)} in this module")
 
     st.markdown("---")
-    st.caption("⚠️ Demo tool — please don't paste confidential or sensitive text.")
-    st.caption("📜 All content is original or public domain — see CONTENT-LICENSES.md")
+    st.caption("Demo tool — please don't paste confidential or sensitive text.")
+    st.caption("All content is original or public domain — see CONTENT-LICENSES.md")
+
+    # Usage analytics — see the block near the top of this file for the full
+    # design rationale. This call is a no-op if analytics isn't configured.
+    track_session_and_page(
+        language, mode, track,
+        lessons[lesson_idx] if mode == "Guided Learning" else None,
+    )
 
 # ===========================================================================
 # PYTHON TRACK
 # ===========================================================================
-if language == "🐍 Python":
+if language == "Python":
 
     # -----------------------------------------------------------------------
     # GUIDED LEARNING — Module 1: Python Fundamentals
     # -----------------------------------------------------------------------
-    if mode == "🏠 Start Here":
+    if mode == "Start Here":
         render_overview()
 
-    elif mode == "🎓 Guided Learning" and track == "🧱 Fundamentals":
+    elif mode == "Guided Learning" and track == "Fundamentals":
         st.markdown(
             "<div class='module-head'><span class='badge badge-green'>Module 1 · Beginner</span>"
             "<h2>Python Fundamentals</h2>"
@@ -1123,13 +1382,13 @@ if language == "🐍 Python":
                 "what each line says. That's both the challenge and the power of programming."
             )
             st.info(
-                "💡 **Python is a programming language** — a way to give a computer precise, "
+                "**Python is a programming language** — a way to give a computer precise, "
                 "step-by-step instructions. Each line of code you see below is one instruction. "
                 "Python is the most widely used language for AI, data analysis, and NLP because "
                 "it's readable and has huge libraries built for exactly this kind of work."
             )
 
-            with st.expander("🔍 Why Python for NLP specifically?"):
+            with st.expander("Why Python for NLP specifically?"):
                 st.markdown(
                     "Almost every major NLP tool — NLTK, spaCy, Hugging Face Transformers, "
                     "scikit-learn — is written in or built for Python. When a company builds "
@@ -1138,7 +1397,7 @@ if language == "🐍 Python":
                     "same language used in real production NLP systems."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- Forgetting quotes around text: `print(Hello)` fails, `print(\"Hello\")` works.\n"
                     "- Mixing up `print(x)` (shows the value) with just writing `x` on its own line "
@@ -1156,7 +1415,7 @@ print("Hello,", name, "- welcome to NLPPlayground!")'''
                 st.write("**Output:**")
                 st.code(f"Hello, {greeting_name} - welcome to NLPPlayground!", language="text")
                 st.caption(
-                    "💡 `print()` displays text on screen. This is usually the first "
+                    "`print()` displays text on screen. This is usually the first "
                     "thing anyone learns in any programming language."
                 )
 
@@ -1177,13 +1436,13 @@ print("Hello,", name, "- welcome to NLPPlayground!")'''
                 "no need to remember or retype the actual value."
             )
             st.info(
-                "💡 A **variable** is a labeled container for a value. Python has a few core "
+                "A **variable** is a labeled container for a value. Python has a few core "
                 "**data types**: whole numbers (`int`), decimals (`float`), text (`str`), and "
                 "true/false values (`bool`). Knowing the type of your data matters — you can't "
                 "do math on text, for example."
             )
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Text data is almost always stored as the `str` type. When you later count "
                     "words, calculate a sentiment score (a `float`), or check whether a word "
@@ -1192,7 +1451,7 @@ print("Hello,", name, "- welcome to NLPPlayground!")'''
                     "common bugs in real NLP code."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- `\"5\" + 3` fails — you can't add text and a number directly (`TypeError`).\n"
                     "- `5 + 3` gives `8`, but `\"5\" + \"3\"` gives `\"53\"` (string concatenation, not addition!).\n"
@@ -1240,9 +1499,9 @@ print(word * 2)            # strings support repetition, not math!'''
                 "character sits in an exact position, and Python lets you grab, count, or "
                 "rearrange those beads however you need."
             )
-            st.info("💡 A **string** is text. Python gives you built-in tools to inspect and transform it — this is the foundation of every NLP task later.")
+            st.info("A **string** is text. Python gives you built-in tools to inspect and transform it — this is the foundation of every NLP task later.")
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Virtually every NLP pipeline starts by cleaning and manipulating strings: "
                     "lowercasing, removing punctuation, splitting into words. Before any "
@@ -1250,7 +1509,7 @@ print(word * 2)            # strings support repetition, not math!'''
                     "your text first passes through string operations exactly like the ones here."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- Case sensitivity: `\"Apple\"` and `\"apple\"` are treated as *completely "
                     "different* strings unless you `.lower()` them first.\n"
@@ -1293,9 +1552,9 @@ print(s[::-1])         # reverse the string'''
                 "of value. A **loop** lets you say \"do this one thing for every item on the "
                 "list\" instead of writing the same instruction over and over by hand."
             )
-            st.info("💡 A **list** stores multiple items. **Loops** let you process each item one at a time — the foundation of analyzing many texts.")
+            st.info("A **list** stores multiple items. **Loops** let you process each item one at a time — the foundation of analyzing many texts.")
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "A document is really just a list of sentences, and a sentence is a list "
                     "of words. Nearly every NLP task — counting word frequency, checking each "
@@ -1304,7 +1563,7 @@ print(s[::-1])         # reverse the string'''
                     "of NLP is just applying it to text."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- Python lists are **zero-indexed** — the first item is `words[0]`, not `words[1]`.\n"
                     "- Forgetting the colon `:` at the end of a `for` line, or the indentation "
@@ -1351,12 +1610,12 @@ print("Longest word:", longest)'''
                 "than just running the same steps blindly every time."
             )
             st.info(
-                "💡 **Conditionals** let code make decisions. This is exactly how sentiment "
+                "**Conditionals** let code make decisions. This is exactly how sentiment "
                 "analysis turns a raw score into a label like 'Positive' or 'Negative' — "
                 "which you'll see for real in Quick Tools."
             )
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Sentiment analysis, spam detection, and many classification tasks boil "
                     "down to conditionals underneath: \"if the score is above this threshold, "
@@ -1364,7 +1623,7 @@ print("Longest word:", longest)'''
                     "a conditional turns into a human-readable label, exactly like this lesson."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- `=` assigns a value, `==` compares two values — mixing them up is one of "
                     "the most common bugs in any language.\n"
@@ -1390,13 +1649,13 @@ print(label)'''
 
             def show_conditional_output():
                 if score_input > 0.1:
-                    label = "Positive 😊"
+                    label = "Positive "
                 elif score_input < -0.1:
-                    label = "Negative 😞"
+                    label = "Negative "
                 else:
-                    label = "Neutral 😐"
+                    label = "Neutral "
                 st.metric("Label", label)
-                st.caption("💡 Try dragging the slider to different values and watch the label change.")
+                st.caption("Try dragging the slider to different values and watch the label change.")
 
             code_and_output(code, show_conditional_output, key="lesson4_conditionals")
 
@@ -1414,9 +1673,9 @@ print(label)'''
                 "steps every time, you define them once, give the recipe a name, and \"call\" "
                 "it whenever you need it — with different ingredients (inputs) each time."
             )
-            st.info("💡 A **function** packages reusable logic. This is exactly how real NLP pipelines clean text before analysis.")
+            st.info("A **function** packages reusable logic. This is exactly how real NLP pipelines clean text before analysis.")
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Every real NLP pipeline is built from small, reusable functions chained "
                     "together: `clean_text()`, `tokenize()`, `remove_stopwords()`, "
@@ -1425,7 +1684,7 @@ print(label)'''
                     "you'll use in the Quick Tools section."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- Forgetting `return`: a function can *do* work without giving anything "
                     "back, unless you explicitly `return` a value.\n"
@@ -1474,11 +1733,11 @@ print(result)'''
                 "get its *value* (a phone number). Dictionaries store `key: value` pairs."
             )
             st.info(
-                "💡 A **dictionary** (`dict`) maps unique keys to values. Unlike lists, you "
+                "A **dictionary** (`dict`) maps unique keys to values. Unlike lists, you "
                 "don't access items by position — you access them by name."
             )
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Word frequency counting — exactly what the **Keyword Extraction** Quick "
                     "Tool does — is fundamentally a dictionary: each word is a key, and its "
@@ -1486,7 +1745,7 @@ print(result)'''
                     "and label mappings are all dictionaries under the hood."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- Accessing a missing key with `d[\"missing\"]` raises a `KeyError` — use "
                     "`d.get(\"missing\", 0)` to safely provide a default instead.\n"
@@ -1537,11 +1796,11 @@ print(word_counts)'''
                 "action: every result table in **Quick Tools** (keywords, entities) is one."
             )
             st.info(
-                "💡 `pandas.DataFrame` is the standard way Python handles tabular data. It's "
+                "`pandas.DataFrame` is the standard way Python handles tabular data. It's "
                 "usually built from a dictionary of equal-length lists — one list per column."
             )
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Every Quick Tool result you've clicked through — keyword frequency "
                     "tables, entity lists — is a `pandas.DataFrame` under the hood. Once you "
@@ -1549,7 +1808,7 @@ print(word_counts)'''
                     "NLP output: words, scores, labels, counts."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- All lists passed into `pd.DataFrame({...})` must be the **same length**, "
                     "or you'll get an error.\n"
@@ -1596,7 +1855,7 @@ print(df.sort_values("length", ascending=False))'''
 
         lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
 
-    elif mode == "🎓 Guided Learning" and track == "🧰 Working with Text Data":
+    elif mode == "Guided Learning" and track == "Working with Text Data":
         st.markdown(
             "<div class='module-head'><span class='badge badge-amber'>Module 2 · Intermediate</span>"
             "<h2>Working with Text Data</h2>"
@@ -1605,7 +1864,7 @@ print(df.sort_values("length", ascending=False))'''
             unsafe_allow_html=True,
         )
         st.markdown(
-            "<div class='card'>🧰 <b>The bridge between Fundamentals and real NLP.</b> "
+            "<div class='card'><b>The bridge between Fundamentals and real NLP.</b> "
             "Module 1 taught you Python using text that was already typed into the page. "
             "Real text arrives in files, in the wrong encoding, full of HTML and URLs, "
             "sometimes inside a PDF — and your code breaks. These seven lessons are about "
@@ -1631,17 +1890,17 @@ print(df.sort_values("length", ascending=False))'''
                 "statement is how you avoid leaking it."
             )
             st.info(
-                "🔑 **Always use `with open(...) as f:`** — it closes the file automatically, "
+                "**Always use `with open(...) as f:`** — it closes the file automatically, "
                 "even if your code crashes midway. Calling `open()` without `with` leaves the "
                 "file handle open, which on large jobs will eventually exhaust your OS limit."
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Every corpus you'll ever work with is a file or a folder of files. "
                     "Reading them correctly — line by line for large files, all at once for "
                     "small ones — is the first step of literally every pipeline."
                 )
-            with st.expander("⚠️ Common mistakes"):
+            with st.expander("Common mistakes"):
                 st.markdown(
                     "- **`\"w\"` silently erases the file.** Opening in write mode truncates "
                     "it to zero bytes before you write anything. Use `\"a\"` to append.\n"
@@ -1689,13 +1948,13 @@ print("Number of lines:", len(lines))'''
                 st.write(lines)
                 st.caption(f"Number of lines: **{len(lines)}**")
                 st.caption(
-                    "☝️ Note `repr()` shows the `\\n` newline characters explicitly — "
+                    "Note `repr()` shows the `\\n` newline characters explicitly — "
                     "`print()` would hide them. Useful when debugging whitespace."
                 )
 
             code_and_output(code, show_m2_files, key="m2_l0_files")
             st.warning(
-                "⚠️ **On this app, files you write disappear.** Streamlit Cloud gives each "
+                "**On this app, files you write disappear.** Streamlit Cloud gives each "
                 "session a temporary filesystem that's wiped when the app restarts. The code "
                 "above is real and correct — run it in Colab or locally to keep the output."
             )
@@ -1715,17 +1974,17 @@ print("Number of lines:", len(lines))'''
                 "their first real dataset."
             )
             st.info(
-                "🔑 **UTF-8 is the answer almost always.** It handles every language plus "
+                "**UTF-8 is the answer almost always.** It handles every language plus "
                 "emoji. When a file refuses to load, it's usually older Latin-1 (Windows-1252) "
                 "data — and the fix is to say so explicitly, not to guess."
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Indian-language text, accented European names, currency symbols like ₹, "
                     "and emoji in social media data **all** depend on correct encoding. A "
                     "mis-decoded corpus silently corrupts every downstream count and token."
                 )
-            with st.expander("⚠️ Common mistakes"):
+            with st.expander("Common mistakes"):
                 st.markdown(
                     "- **Assuming `len()` counts bytes.** It counts *characters*. "
                     "`\"₹\"` is 1 character but 3 bytes in UTF-8.\n"
@@ -1769,13 +2028,13 @@ print("Replaced:", latin_bytes.decode("utf-8", errors="replace"))'''
                 st.success(f'Correct (latin-1): {latin_bytes.decode("latin-1")}')
                 st.warning(f'errors="replace": {latin_bytes.decode("utf-8", errors="replace")}')
                 st.caption(
-                    "☝️ 24 characters but 32 bytes — the accented letters and ₹ take "
+                    "24 characters but 32 bytes — the accented letters and ₹ take "
                     "more than one byte each. That gap is why encoding exists."
                 )
 
             code_and_output(code, show_m2_encoding, key="m2_l1_encoding")
             st.caption(
-                "🔗 This is exactly the fallback the **Quick Tools** file uploader uses: "
+                "This is exactly the fallback the **Quick Tools** file uploader uses: "
                 "try UTF-8, fall back to Latin-1, and *tell you* it happened."
             )
 
@@ -1793,17 +2052,17 @@ print("Replaced:", latin_bytes.decode("utf-8", errors="replace"))'''
                 "easiest to cut yourself on."
             )
             st.info(
-                "🔑 **The building blocks:** `\\d` a digit · `\\w` a word character · "
+                "**The building blocks:** `\\d` a digit · `\\w` a word character · "
                 "`\\s` whitespace · `+` one or more · `*` zero or more · `{2,}` at least two · "
                 "`[abc]` any of these · `[^>]` anything except `>`"
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Regex does the work *before* the linguistics: stripping HTML, pulling out "
                     "identifiers, redacting personal data, splitting on custom boundaries. "
                     "Tokenizers themselves are built out of regexes."
                 )
-            with st.expander("⚠️ Common mistakes"):
+            with st.expander("Common mistakes"):
                 st.markdown(
                     "- **Over-capturing.** The classic: a lazy email pattern swallows the "
                     "sentence's full stop. There's a live demonstration of exactly this below.\n"
@@ -1847,7 +2106,7 @@ print("redacted:", re.sub(fixed, "[EMAIL]", text))'''
                 st.write(f_res)
                 if n_res != f_res:
                     st.error(
-                        "👆 **Look closely — they differ.** The naive pattern ends with "
+                        "**Look closely — they differ.** The naive pattern ends with "
                         "`[\\w.]+`, and `.` is in that set, so it swallows the full stop "
                         "at the end of the sentence. This is a real bug I hit writing this "
                         "very lesson, not a hypothetical one."
@@ -1876,13 +2135,13 @@ print("redacted:", re.sub(fixed, "[EMAIL]", text))'''
                 "Cleaning is a **sequence of small, ordered transformations** — and, as in the "
                 "Preprocessing Pipeline tool, the order changes the result."
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Skip cleaning and `<b>great</b>` and `great` count as different words, "
                     "URLs dominate your keyword list, and `The` and `the` split every count "
                     "in two. Cleaning is what makes the numbers mean anything."
                 )
-            with st.expander("⚠️ Common mistakes"):
+            with st.expander("Common mistakes"):
                 st.markdown(
                     "- **Cleaning too aggressively.** Stripping all punctuation destroys "
                     "sentence boundaries — so `sent_tokenize` stops working afterwards.\n"
@@ -1945,16 +2204,16 @@ for name, val in [("strip", step1), ("de-HTML", step2), ("de-URL", step3),
                 "no loop required."
             )
             st.info(
-                "🔑 `.str` methods **chain**: `df[\"col\"].str.strip().str.lower()` — each "
+                "`.str` methods **chain**: `df[\"col\"].str.strip().str.lower()` — each "
                 "returns a new Series, so you build the pipeline left to right."
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "This is the bridge from single-text demos to real corpora. Every dataset "
                     "you meet — reviews, tweets, filings, support tickets — arrives as a "
                     "table with a text column."
                 )
-            with st.expander("⚠️ Common mistakes"):
+            with st.expander("Common mistakes"):
                 st.markdown(
                     "- **Forgetting missing values.** `.str` methods return `NaN` for `None`, "
                     "and `.str.contains()` will raise unless you pass `na=False`.\n"
@@ -1992,7 +2251,7 @@ print(df)'''
                 df_demo["words"] = df_demo["clean"].str.split().str.len()
                 st.dataframe(df_demo, use_container_width=True)
                 st.caption(
-                    "☝️ Row 3 is `None` and stays `NaN` throughout — pandas propagates "
+                    "Row 3 is `None` and stays `NaN` throughout — pandas propagates "
                     "missing values instead of guessing. Note `length` is **14.0**, not 14: "
                     "one missing value forced the whole column to float."
                 )
@@ -2014,17 +2273,17 @@ print(df)'''
                 "real first step of a project."
             )
             st.info(
-                "🔑 A PDF describes **where marks go on a page**, not what the words are. "
+                "A PDF describes **where marks go on a page**, not what the words are. "
                 "There's no guaranteed reading order, no reliable paragraph structure. "
                 "Extraction is therefore always approximate — expect to clean up afterwards."
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "An analyst asked to 'analyse sentiment in these 200 annual reports' "
                     "spends most of the effort here, not on the sentiment model. PDF handling "
                     "is one of the most practically valuable skills in this whole app."
                 )
-            with st.expander("⚠️ Common mistakes"):
+            with st.expander("Common mistakes"):
                 st.markdown(
                     "- **Scanned PDFs contain no text at all** — just images of text. "
                     "`extract_text()` returns empty. Those need OCR (e.g. Tesseract), which "
@@ -2072,13 +2331,13 @@ print("Total characters:", len(full_text))
                             )
                         else:
                             st.text_area("Extracted text (preview)", full[:3000], height=200, key="m2_pdf_out")
-                            if st.button("📄 Send this to Quick Tools", key="m2_pdf_send"):
+                            if st.button("Send this to Quick Tools", key="m2_pdf_send"):
                                 st.session_state.corpus_text = full
-                                st.success("Loaded into the shared corpus — open ⚡ Quick Tools to analyse it.")
+                                st.success("Loaded into the shared corpus — open Quick Tools to analyse it.")
                     except Exception as e:
                         st.error(f"Couldn't read that PDF: {e}")
                 else:
-                    st.info("👆 Upload a PDF to see live extraction. No file is stored.")
+                    st.info("Upload a PDF to see live extraction. No file is stored.")
 
             code_and_output(code, show_m2_pdf, key="m2_l5_pdf")
 
@@ -2096,11 +2355,11 @@ print("Total characters:", len(full_text))
                 "is information, not failure.**"
             )
             st.info(
-                "🔑 **Read a traceback bottom-up.** The last line names the error type and "
+                "**Read a traceback bottom-up.** The last line names the error type and "
                 "what went wrong. Work upward to find the line in *your* code — usually "
                 "the lowest line mentioning a file you actually wrote."
             )
-            with st.expander("💡 Why this matters"):
+            with st.expander("Why this matters"):
                 st.markdown(
                     "Every error below is one you *will* hit working with text: a token index "
                     "past the end of a list, a number that won't parse, a dictionary key that "
@@ -2155,7 +2414,7 @@ except TypeError as e:
                     use_container_width=True, hide_index=True,
                 )
                 st.caption(
-                    "☝️ These are real exceptions raised and caught live, not text I typed in."
+                    "These are real exceptions raised and caught live, not text I typed in."
                 )
 
             code_and_output(code, show_m2_errors, key="m2_l6_errors")
@@ -2184,11 +2443,11 @@ except TypeError as e:
                 except Exception as e:
                     actual = type(e).__name__
                     if actual == guess:
-                        st.success(f"✅ Correct — `{guess_snippet}` raises **{actual}**: {e}")
+                        st.success(f"Correct — `{guess_snippet}` raises **{actual}**: {e}")
                     else:
-                        st.error(f"❌ Not quite. `{guess_snippet}` raises **{actual}**, not {guess}. ({e})")
+                        st.error(f"Not quite. `{guess_snippet}` raises **{actual}**, not {guess}. ({e})")
 
-            if st.button("✓ Module 2 complete", key="m2_done"):
+            if st.button("Module 2 complete", key="m2_done"):
                 st.success("You can now get real text out of real files. On to the NLTK and spaCy tracks →")
 
     # -----------------------------------------------------------------------
@@ -2197,7 +2456,7 @@ except TypeError as e:
 
         lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
 
-    elif mode == "🎓 Guided Learning" and track == "📚 NLTK":
+    elif mode == "Guided Learning" and track == "NLTK":
         st.markdown(
             "<div class='module-head'><span class='badge badge-nltk'>Module 3 · NLP</span>"
             "<h2>NLTK</h2>"
@@ -2206,10 +2465,10 @@ except TypeError as e:
             unsafe_allow_html=True,
         )
         st.markdown(
-            "<div class='card'>📚 <b>NLTK</b> (Natural Language Toolkit) is the classic, "
+            "<div class='card'><b>NLTK</b> (Natural Language Toolkit) is the classic, "
             "lexicon- and rule-based Python NLP library — great for understanding "
             "<i>how</i> NLP tasks work under the hood. Lessons 0, 1, 3 and 4 use the exact "
-            "same example sentences as the <b>⚡ spaCy</b> track, so you can switch tracks "
+            "same example sentences as the <b>spaCy</b> track, so you can switch tracks "
             "and compare the two libraries directly on identical input.</div>",
             unsafe_allow_html=True,
         )
@@ -2220,14 +2479,14 @@ except TypeError as e:
         # --- NLTK Lesson 0: Tokenization ---
         if lesson_idx == 0:
             st.subheader("Tokenization")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "Tokenization splits text into individual pieces — words, punctuation, "
                 "contractions — that downstream tasks (POS tagging, NER, etc.) operate on. "
                 "NLTK's `word_tokenize` uses the Penn Treebank tokenization rules."
             )
             st.info(f"Shared example sentence: *\"{SHARED_TEXT_TOKENS}\"*")
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Every NLP pipeline starts here. Get tokenization wrong and everything "
                     "downstream — counts, tags, entities — is wrong too. Notice how `don't` "
@@ -2254,14 +2513,14 @@ print(tokens)'''
         # --- NLTK Lesson 1: Stopwords ---
         if lesson_idx == 1:
             st.subheader("Stopwords")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "**Stopwords** are common words (*the, is, at, and...*) that carry little "
                 "meaning on their own and are often filtered out before analysis like "
                 "keyword extraction."
             )
             st.info(f"Shared example sentence: *\"{SHARED_TEXT_TOKENS}\"*")
-            with st.expander("⚠️ Common mistake"):
+            with st.expander("Common mistake"):
                 st.markdown(
                     "Don't always remove stopwords blindly — for sentiment analysis, words "
                     "like *not* or *no* are technically stopwords in some lists but change "
@@ -2293,13 +2552,13 @@ print(filtered)'''
         # --- NLTK Lesson 2: Stemming ---
         if lesson_idx == 2:
             st.subheader("Stemming")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "**Stemming** chops words down to a crude root form using fixed rules — "
                 "fast, but the result isn't always a real word. NLTK's classic algorithm "
                 "is the **Porter Stemmer**."
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Stemming groups related words (*run, running, runs* → `run`) so they "
                     "count as \"the same word\" in tasks like keyword frequency. The tradeoff: "
@@ -2320,7 +2579,7 @@ print([(w, ps.stem(w)) for w in words])'''
                 rows = [(w, ps.stem(w)) for w in stem_words]
                 st.dataframe(pd.DataFrame(rows, columns=["Word", "Stem"]), use_container_width=True, hide_index=True)
                 st.caption(
-                    "⚠️ Notice `studies` → `studi` and `easily` → `easili` — not real words. "
+                    "Notice `studies` → `studi` and `easily` → `easili` — not real words. "
                     "That's expected: stemming trades correctness for speed via fixed rules."
                 )
 
@@ -2361,7 +2620,7 @@ print("Unique stems:", len(set(stems)))'''
                 c2.metric("Unique stems after", n_unique_stems)
                 if n_unique_stems < n_unique_words:
                     st.caption(
-                        f"💡 Stemming collapsed {n_unique_words - n_unique_stems} word-form(s) "
+                        f"Stemming collapsed {n_unique_words - n_unique_stems} word-form(s) "
                         "together — e.g. plural/singular or verb tense variants that share a "
                         "root now count as the same term. On short text this reduction is "
                         "often small or zero; it becomes more visible on longer documents "
@@ -2369,7 +2628,7 @@ print("Unique stems:", len(set(stems)))'''
                     )
                 else:
                     st.caption(
-                        "💡 No reduction here — this text happens to have few words sharing "
+                        "No reduction here — this text happens to have few words sharing "
                         "a common root. Try a longer or more repetitive passage (or the "
                         "Classification & Clustering module's document boxes) to see stemming "
                         "actually shrink the vocabulary."
@@ -2380,7 +2639,7 @@ print("Unique stems:", len(set(stems)))'''
         # --- NLTK Lesson 3: POS Tagging ---
         if lesson_idx == 3:
             st.subheader("Part-of-Speech (POS) Tagging")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "POS tagging labels each token with its grammatical role — noun, verb, "
                 "adjective, etc. NLTK uses **Penn Treebank tags** (e.g. `NNP` = proper noun, "
@@ -2409,14 +2668,14 @@ print(tagged)'''
         # --- NLTK Lesson 4: NER ---
         if lesson_idx == 4:
             st.subheader("Named Entity Recognition")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "NLTK's built-in NER (`ne_chunk`) is a rule-based chunker layered on top of "
                 "POS tags — lightweight, but noticeably less accurate than model-based "
                 "approaches (see the **spaCy → NER** lesson on this exact sentence)."
             )
             st.info(f"Shared example sentence: *\"{SHARED_TEXT_ENTITIES}\"*")
-            with st.expander("⚠️ Common mistake"):
+            with st.expander("Common mistake"):
                 st.markdown(
                     "Don't assume `ne_chunk` output is production-accurate. On this exact "
                     "sentence NLTK makes **three** verifiable errors: it tags **\"CFO\"** as an "
@@ -2456,13 +2715,13 @@ for subtree in tree:
         # --- NLTK Lesson 5: Sentiment (VADER) ---
         if lesson_idx == 5:
             st.subheader("Sentiment Analysis (VADER)")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "**VADER** (Valence Aware Dictionary and sEntiment Reasoner) is a "
                 "lexicon-based sentiment tool bundled with NLTK, tuned for short, informal "
                 "text like reviews and social media posts."
             )
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "spaCy has **no built-in equivalent** to VADER — that's a real, "
                     "structural difference between the two libraries, not a gap in this app. "
@@ -2491,7 +2750,7 @@ print(sia.polarity_scores(text))'''
                     scores = sia.polarity_scores(sample_text)
                     st.write(scores)
                     compound = scores["compound"]
-                    label = "Positive 😊" if compound > 0.05 else "Negative 😞" if compound < -0.05 else "Neutral 😐"
+                    label = "Positive " if compound > 0.05 else "Negative " if compound < -0.05 else "Neutral "
                     st.metric("Overall", label)
                 else:
                     st.warning("Enter a sentence above.")
@@ -2503,11 +2762,11 @@ print(sia.polarity_scores(text))'''
         # only runnable, never explained step by step in Guided Learning.
         if lesson_idx == 6:
             st.subheader("Keyword Extraction")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "The simplest form of **keyword extraction** is counting word frequency "
                 "after removing stopwords — this is **Term Frequency (TF)**, the same "
-                "concept taught more formally in the 🧪 Classification & Clustering module. "
+                "concept taught more formally in the Classification & Clustering module. "
                 "Here's the NLTK version on our shared example sentence."
             )
             st.info(f"Shared example sentence: *\"{SHARED_TEXT_ENTITIES}\"*")
@@ -2542,14 +2801,14 @@ print(Counter(keywords).most_common(10))'''
             code_and_output(code, show_nltk_keywords, key="nltk_lesson6_keywords")
 
             st.caption(
-                "💡 Try the **🔧 Quick Tools → 🔑 Keyword Extraction** tool to run this on "
+                "Try the **Quick Tools → Keyword Extraction** tool to run this on "
                 "your own text, with NLTK and spaCy shown side by side."
             )
 
         # --- NLTK Lesson 7: Word Cloud ---
         if lesson_idx == 7:
             st.subheader("Word Cloud")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "A word cloud is a **visualization** of exactly the keyword frequencies "
                 "from the previous lesson — same numbers, sized by frequency instead of "
@@ -2595,7 +2854,7 @@ plt.show()'''
         # --- NLTK Lesson 8: Frequency Distributions ---
         if lesson_idx == 8:
             st.subheader("Frequency Distributions")
-            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown("<span class='badge badge-nltk'>NLTK</span>", unsafe_allow_html=True)
             st.markdown(
                 "NLTK has a purpose-built object for exactly the counting you've been doing "
                 "informally since **Keyword Extraction**: `FreqDist`. It's a specialized "
@@ -2605,7 +2864,7 @@ plt.show()'''
             )
             st.info(f"Shared example sentence: *\"{SHARED_TEXT_ENTITIES}\"*")
 
-            with st.expander("💡 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "This is descriptive statistics for text — the same instinct as `.describe()` "
                     "on a numeric DataFrame column, applied to word counts instead. Before "
@@ -2660,19 +2919,19 @@ print("Hapaxes (appear once):", fd.hapaxes())'''
                     shown = ", ".join(f"`{w}`" for w in hapaxes[:15])
                     more = f" (+{len(hapaxes) - 15} more)" if len(hapaxes) > 15 else ""
                     st.caption(
-                        f"💡 **{len(hapaxes)} hapax(es)** — words appearing exactly once: "
+                        f"**{len(hapaxes)} hapax(es)** — words appearing exactly once: "
                         f"{shown}{more}. On short text almost every word is a hapax (nothing "
                         "repeats yet); on longer documents, a high hapax count relative to "
                         "total words is itself a descriptive statistic — it tells you the "
                         "vocabulary is diverse rather than repetitive."
                     )
                 else:
-                    st.caption("💡 No hapaxes — every word here repeats at least once.")
+                    st.caption("No hapaxes — every word here repeats at least once.")
 
             code_and_output(code, show_freqdist, key="nltk_lesson8_freqdist")
 
-            if st.button("✓ NLTK track complete", key="nltk_done"):
-                st.success("Nice work! Try the ⚡ spaCy track next to see the same tasks with a model-based library →")
+            if st.button("NLTK track complete", key="nltk_done"):
+                st.success("Nice work! Try the spaCy track next to see the same tasks with a model-based library →")
 
     # -----------------------------------------------------------------------
     # GUIDED LEARNING — spaCy Track
@@ -2680,7 +2939,7 @@ print("Hapaxes (appear once):", fd.hapaxes())'''
 
         lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
 
-    elif mode == "🎓 Guided Learning" and track == "⚡ spaCy":
+    elif mode == "Guided Learning" and track == "spaCy":
         st.markdown(
             "<div class='module-head'><span class='badge badge-spacy'>Module 4 · NLP</span>"
             "<h2>spaCy</h2>"
@@ -2689,10 +2948,10 @@ print("Hapaxes (appear once):", fd.hapaxes())'''
             unsafe_allow_html=True,
         )
         st.markdown(
-            "<div class='card'>⚡ <b>spaCy</b> is a modern, model-based NLP library — "
+            "<div class='card'><b>spaCy</b> is a modern, model-based NLP library — "
             "faster to get accurate results from, but more of a \"black box\" than NLTK's "
             "explicit rules. Lessons 0, 1, 3 and 4 reuse the exact same example sentences "
-            "as the <b>📚 NLTK</b> track for direct comparison.</div>",
+            "as the <b>NLTK</b> track for direct comparison.</div>",
             unsafe_allow_html=True,
         )
 
@@ -2706,7 +2965,7 @@ print("Hapaxes (appear once):", fd.hapaxes())'''
             # --- spaCy Lesson 0: Tokenization ---
             if lesson_idx == 0:
                 st.subheader("Tokenization")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "spaCy tokenizes text using a combination of rules and exceptions "
                     "(not a statistical model, for tokenization specifically)."
@@ -2733,7 +2992,7 @@ print([t.text for t in doc])'''
                 code_and_output(code, show_spacy_tok, key="spacy_lesson0_tokenize")
                 st.markdown(
                     "<div class='lib-section'></div>"
-                    "🔍 **NLTK vs spaCy here:** on this sentence, both split `don't` → "
+                    "**NLTK vs spaCy here:** on this sentence, both split `don't` → "
                     "`do` + `n't` and `Corp's` → `Corp` + `'s` identically — for common "
                     "contractions, the two tokenizers largely agree. Differences show up more "
                     "on messier real-world text (URLs, emojis, unusual punctuation).",
@@ -2743,7 +3002,7 @@ print([t.text for t in doc])'''
             # --- spaCy Lesson 1: Stopwords ---
             if lesson_idx == 1:
                 st.subheader("Stopwords")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "spaCy flags stopwords via a per-token boolean attribute, `token.is_stop`, "
                     "rather than a separate list you filter against manually."
@@ -2770,8 +3029,8 @@ print(filtered)'''
                 code_and_output(code, show_spacy_stopwords, key="spacy_lesson1_stopwords")
                 st.markdown(
                     "<div class='lib-section'></div>"
-                    "🔍 **NLTK vs spaCy here:** run the same sentence through the "
-                    "**📚 NLTK → Stopwords** lesson and compare — NLTK's default list keeps "
+                    "**NLTK vs spaCy here:** run the same sentence through the "
+                    "**NLTK → Stopwords** lesson and compare — NLTK's default list keeps "
                     "\"everyone\" while spaCy's marks it as a stopword. The two libraries "
                     "ship *different* default stopword lists, so results genuinely diverge.",
                     unsafe_allow_html=True,
@@ -2780,15 +3039,15 @@ print(filtered)'''
             # --- spaCy Lesson 2: Lemmatization ---
             if lesson_idx == 2:
                 st.subheader("Lemmatization")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "**Lemmatization** reduces a word to its real dictionary base form "
                     "(the *lemma*), using vocabulary and grammar rules — slower than stemming, "
                     "but the output is always a real word."
                 )
-                with st.expander("💡 Why this matters for NLP"):
+                with st.expander("Why this matters for NLP"):
                     st.markdown(
-                        "Compare this directly to the **📚 NLTK → Stemming** lesson, run on "
+                        "Compare this directly to the **NLTK → Stemming** lesson, run on "
                         "the identical word list. `studies` → `study` (correct) here, vs "
                         "`studi` (truncated) there."
                     )
@@ -2819,7 +3078,7 @@ print([(t.text, t.lemma_) for t in doc])'''
                     "The 7-word list above is a clean, curated example. Real text is "
                     "messier — here's spaCy's lemmatizer applied to every word in the "
                     "shared text, with the vocabulary size before and after, for a direct "
-                    "comparison with the **📚 NLTK → Stemming** lesson's same measurement."
+                    "comparison with the **NLTK → Stemming** lesson's same measurement."
                 )
 
                 code_shared_lemma = f'''import spacy
@@ -2847,7 +3106,7 @@ print("Unique lemmas:", len(set(lemmas)))'''
                     c2.metric("Unique lemmas after", n_unique_lemmas)
                     if n_unique_lemmas < n_unique_words:
                         st.caption(
-                            f"💡 Lemmatization collapsed {n_unique_words - n_unique_lemmas} "
+                            f"Lemmatization collapsed {n_unique_words - n_unique_lemmas} "
                             "word-form(s) together, and — unlike stemming — every collapsed "
                             "form is still a real dictionary word. Compare this reduction "
                             "count to the NLTK Stemming lesson's on the same text: they "
@@ -2855,7 +3114,7 @@ print("Unique lemmas:", len(set(lemmas)))'''
                         )
                     else:
                         st.caption(
-                            "💡 No reduction here — try a longer or more repetitive passage "
+                            "No reduction here — try a longer or more repetitive passage "
                             "to see lemmatization actually shrink the vocabulary."
                         )
 
@@ -2863,7 +3122,7 @@ print("Unique lemmas:", len(set(lemmas)))'''
 
                 st.markdown(
                     "<div class='lib-section'></div>"
-                    "🔍 **NLTK vs spaCy here:** every lemma above is a real word — the "
+                    "**NLTK vs spaCy here:** every lemma above is a real word — the "
                     "concrete, verifiable payoff of a dictionary/model-based approach over "
                     "the Porter Stemmer's fixed truncation rules.",
                     unsafe_allow_html=True,
@@ -2872,7 +3131,7 @@ print("Unique lemmas:", len(set(lemmas)))'''
             # --- spaCy Lesson 3: POS Tagging ---
             if lesson_idx == 3:
                 st.subheader("Part-of-Speech (POS) Tagging")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "spaCy gives you **two** POS layers per token: a coarse universal tag "
                     "(`token.pos_`, e.g. `PROPN`) and a fine-grained Penn-Treebank-style tag "
@@ -2899,8 +3158,8 @@ print([(t.text, t.pos_, t.tag_) for t in doc])'''
                 code_and_output(code, show_spacy_pos, key="spacy_lesson3_pos")
                 st.markdown(
                     "<div class='lib-section'></div>"
-                    "🔍 **NLTK vs spaCy here:** compare `Fine-grained Tag` to the "
-                    "**📚 NLTK → POS Tagging** output on this same sentence — both use the "
+                    "**NLTK vs spaCy here:** compare `Fine-grained Tag` to the "
+                    "**NLTK → POS Tagging** output on this same sentence — both use the "
                     "same Penn Treebank tag set (`NNP`, `DT`, `IN`...) and largely agree; "
                     "spaCy just adds the extra universal-tag layer on top.",
                     unsafe_allow_html=True,
@@ -2909,7 +3168,7 @@ print([(t.text, t.pos_, t.tag_) for t in doc])'''
             # --- spaCy Lesson 4: NER ---
             if lesson_idx == 4:
                 st.subheader("Named Entity Recognition")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "spaCy's NER is a trained statistical model — it recognizes a wider range "
                     "of entity types (money, dates, GPEs) than NLTK's rule-based chunker, and "
@@ -2939,7 +3198,7 @@ for ent in doc.ents:
 
                 code_and_output(code, show_spacy_ner, key="spacy_lesson4_ner")
 
-                st.markdown("**🎨 Entities highlighted in context**")
+                st.markdown("**Entities highlighted in context**")
                 st.caption(
                     "Rendered with `displacy.render(doc, style='ent')` — spaCy's built-in "
                     "visualiser. Seeing entities *in the sentence* makes the misses obvious "
@@ -2948,7 +3207,7 @@ for ent in doc.ents:
                 render_entities(nlp_spacy(SHARED_TEXT_ENTITIES), key="viz_lesson_ner")
                 st.markdown(
                     "<div class='lib-section'></div>"
-                    "🔍 **NLTK vs spaCy here — and neither is perfect:** on this exact sentence "
+                    "**NLTK vs spaCy here — and neither is perfect:** on this exact sentence "
                     "NLTK mislabels \"CFO\" and \"Example Corp\" and \"Bengaluru\" all as the wrong "
                     "types. spaCy correctly tags Bengaluru as `GPE` and additionally catches "
                     "`$2.5 million` as MONEY and both dates as DATE — categories NLTK's label "
@@ -2956,7 +3215,7 @@ for ent in doc.ents:
                     unsafe_allow_html=True,
                 )
                 st.warning(
-                    "⚠️ **But look at what spaCy misses:** it doesn't tag \"Example Corp\" as an "
+                    "**But look at what spaCy misses:** it doesn't tag \"Example Corp\" as an "
                     "organisation *at all* — it returns no ORG entity here. That's not a bug we "
                     "introduced; it's the central limitation of model-based NER. spaCy learned "
                     "what companies look like from real-world training text, and the deliberately "
@@ -2968,13 +3227,13 @@ for ent in doc.ents:
             # --- spaCy Lesson 5: Dependency Parsing ---
             if lesson_idx == 5:
                 st.subheader("Dependency Parsing")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "Dependency parsing shows the **grammatical relationship** between "
                     "every pair of words in a sentence (subject, object, modifier...) — "
                     "who did what to whom, structurally."
                 )
-                with st.expander("💡 Why this matters for NLP"):
+                with st.expander("Why this matters for NLP"):
                     st.markdown(
                         "NLTK doesn't include an easy, ready-to-use dependency parser out of "
                         "the box (it needs external tools like the Stanford Parser) — this is "
@@ -3003,7 +3262,7 @@ for token in doc:
 
                 code_and_output(code, show_spacy_dep, key="spacy_lesson5_dep")
 
-                st.markdown("**🎨 The parse as a diagram**")
+                st.markdown("**The parse as a diagram**")
                 st.caption(
                     "The table above and this diagram are the *same data*. Grammatical "
                     "structure is a tree, so the arrows make relationships visible that "
@@ -3017,9 +3276,9 @@ for token in doc:
             # same honest caveat already established in the Quick Tools version.
             if lesson_idx == 6:
                 st.subheader("Sentiment (Lexicon-based)")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.caption(
-                    "ℹ️ **Note:** spaCy has **no built-in sentiment analysis** — that's a "
+                    "**Note:** spaCy has **no built-in sentiment analysis** — that's a "
                     "genuine, structural difference from NLTK (which ships VADER), not "
                     "something skipped here. This lesson uses spaCy for tokenization and "
                     "lemmatization plus a small illustrative lexicon, so every number is "
@@ -3058,19 +3317,19 @@ print("Positive:", pos_count, "| Negative:", neg_count)'''
                     negative_words = {"terrible", "bad", "worst", "hate", "confusing", "boring"}
                     pos_count = sum(1 for t in doc if t.lemma_.lower() in positive_words)
                     neg_count = sum(1 for t in doc if t.lemma_.lower() in negative_words)
-                    label = "Positive 😊" if pos_count > neg_count else "Negative 😞" if neg_count > pos_count else "Neutral 😐"
+                    label = "Positive " if pos_count > neg_count else "Negative " if neg_count > pos_count else "Neutral "
                     st.metric("Overall", label)
                     c1, c2 = st.columns(2)
                     c1.metric("Positive words", pos_count)
                     c2.metric("Negative words", neg_count)
-                    st.caption("💡 spaCy's `.lemma_` reduces words to their base form before matching — \"impressed\" and \"impressing\" would match the same lexicon entry.")
+                    st.caption("spaCy's `.lemma_` reduces words to their base form before matching — \"impressed\" and \"impressing\" would match the same lexicon entry.")
 
                 code_and_output(code, show_spacy_sentiment_lesson, key="spacy_lesson6_sentiment")
 
             # --- spaCy Lesson 7: Keyword Extraction ---
             if lesson_idx == 7:
                 st.subheader("Keyword Extraction")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "Same **Term Frequency** idea as the NLTK track's Keyword Extraction "
                     "lesson, but using spaCy's `.lemma_` (base form) instead of NLTK's raw "
@@ -3106,14 +3365,14 @@ print(Counter(keywords).most_common(10))'''
                 code_and_output(code, show_spacy_keywords, key="spacy_lesson7_keywords")
 
                 st.caption(
-                    "💡 Try the **🔧 Quick Tools → 🔑 Keyword Extraction** tool to run this on "
+                    "Try the **Quick Tools → Keyword Extraction** tool to run this on "
                     "your own text, with NLTK and spaCy shown side by side."
                 )
 
             # --- spaCy Lesson 8: Word Cloud ---
             if lesson_idx == 8:
                 st.subheader("Word Cloud")
-                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge badge-spacy'>spaCy</span>", unsafe_allow_html=True)
                 st.markdown(
                     "A visualization of the previous lesson's lemma frequencies — same "
                     "numbers, sized by frequency instead of listed in a table."
@@ -3152,7 +3411,7 @@ plt.show()'''
 
                 code_and_output(code, show_spacy_wordcloud, key="spacy_lesson8_wordcloud")
 
-                if st.button("✓ spaCy track complete", key="spacy_done"):
+                if st.button("spaCy track complete", key="spacy_done"):
                     st.success("Great work — you've now seen the same NLP tasks through both a classic (NLTK) and modern (spaCy) lens.")
 
             lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
@@ -3167,7 +3426,7 @@ plt.show()'''
     # corpus to work with, and a REAL classification target: the era, computed
     # mechanically from the year in each filename, not an invented label.
     # -----------------------------------------------------------------------
-    elif mode == "🎓 Guided Learning" and track == "🧪 Classification & Clustering":
+    elif mode == "Guided Learning" and track == "Classification & Clustering":
         st.markdown(
             "<div class='module-head'><span class='badge badge-amber'>Module 5 · Machine Learning</span>"
             "<h2>Classification &amp; Clustering</h2>"
@@ -3181,7 +3440,7 @@ plt.show()'''
         if lesson_idx == 0:
             st.subheader("Term Frequency (TF)")
             st.markdown(
-                "<span class='badge badge-amber'>📊 Feature Extraction</span>",
+                "<span class='badge badge-amber'>Feature Extraction</span>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -3194,7 +3453,7 @@ plt.show()'''
             docs_result = render_document_boxes(key_prefix="cc_docbox")
 
             if not docs_result:
-                st.info("👆 Fill in the documents above (or keep the defaults) and press Analyze to see Term Frequency per document.")
+                st.info("Fill in the documents above (or keep the defaults) and press Analyze to see Term Frequency per document.")
             else:
                 code = '''from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
@@ -3223,7 +3482,7 @@ print(tf.most_common(10))'''
                         st.bar_chart(tf_df.set_index("Term"))
                         top_term, top_count = tf[0]
                         st.caption(
-                            f"💡 In plain terms: the word **\"{top_term}\"** appears "
+                            f"In plain terms: the word **\"{top_term}\"** appears "
                             f"**{top_count} time(s)** in this document, after lowercasing, "
                             "removing punctuation, and dropping common stopwords (\"the\", "
                             "\"and\", etc.) — more than any other word, so it tops the list. "
@@ -3235,7 +3494,7 @@ print(tf.most_common(10))'''
                 code_and_output(code, show_tf, key="cc_tf")
 
                 st.info(
-                    "💡 **The limitation TF-IDF fixes:** words like \"the\" or \"movie\" "
+                    "**The limitation TF-IDF fixes:** words like \"the\" or \"movie\" "
                     "might top this list for *every* document in your set — high TF doesn't "
                     "mean *distinctive*. The next lesson shows the fix, using these same "
                     f"{len(docs_result)} documents."
@@ -3245,7 +3504,7 @@ print(tf.most_common(10))'''
         elif lesson_idx == 1:
             st.subheader("TF-IDF — Term Frequency × Inverse Document Frequency")
             st.markdown(
-                "<span class='badge badge-amber'>📊 Feature Extraction</span>",
+                "<span class='badge badge-amber'>Feature Extraction</span>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -3258,7 +3517,7 @@ print(tf.most_common(10))'''
             docs_result = render_document_boxes(key_prefix="cc_docbox")
 
             if not docs_result:
-                st.info("👆 Fill in the documents above (or keep the defaults) and press Analyze to see TF-IDF across your set.")
+                st.info("Fill in the documents above (or keep the defaults) and press Analyze to see TF-IDF across your set.")
             elif len(docs_result) < 2:
                 st.warning(
                     "TF-IDF needs **at least 2 documents** to mean anything — only "
@@ -3295,7 +3554,7 @@ print(top10)'''
                         st.bar_chart(df.set_index("Term"))
                         top_term, top_weight = top[0]
                         st.caption(
-                            f"💡 In plain terms: **\"{top_term}\"** has the highest TF-IDF "
+                            f"In plain terms: **\"{top_term}\"** has the highest TF-IDF "
                             f"weight ({top_weight}) in **{pick}** — meaning it appears "
                             "often *here* but rarely or never in your other documents. A "
                             "word that's frequent in every document (like \"movie\" across "
@@ -3316,7 +3575,7 @@ print(top10)'''
         elif lesson_idx == 2:
             st.subheader("Naive Bayes Classification")
             st.markdown(
-                "<span class='badge badge-amber'>🧪 Classification</span>",
+                "<span class='badge badge-amber'>Classification</span>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -3348,7 +3607,7 @@ print(top10)'''
                 "practice_tests": _tests.round(1),
                 "result": _result,
             })
-            with st.expander(f"📋 All {len(study_data)} rows of training data"):
+            with st.expander(f"All {len(study_data)} rows of training data"):
                 st.dataframe(study_data, use_container_width=True, hide_index=True)
             st.caption(
                 f"Class balance: {(study_data['result'] == 'Pass').sum()} Pass, "
@@ -3400,7 +3659,7 @@ print(clf.predict_proba(new_student))'''
                 proba_dict = dict(zip(clf.classes_, proba.round(3)))
                 pred_conf = proba_dict[pred]
                 st.caption(
-                    f"💡 In plain terms: given **{new_hours} hours studied** and "
+                    f"In plain terms: given **{new_hours} hours studied** and "
                     f"**{new_tests} practice tests**, the model predicts **{pred}** with "
                     f"**{pred_conf:.0%} confidence** (full breakdown: {proba_dict}). This "
                     "confidence comes from how close the blue star sits to the green "
@@ -3425,15 +3684,15 @@ print(clf.predict_proba(new_student))'''
             cc_clf_source = st.radio(
                 "Text corpus",
                 [
-                    "🏛️ 60 US Inaugural Addresses, by era (built-in)",
-                    "✍️ 3,300+ passages, by author (built-in, bigger)",
-                    "📁 Upload your own labeled CSV",
+                    "60 US Inaugural Addresses, by era (built-in)",
+                    "3,300+ passages, by author (built-in, bigger)",
+                    "Upload your own labeled CSV",
                 ],
                 key="cc_clf_source_choice",
                 horizontal=True,
             )
 
-            if cc_clf_source.startswith("🏛️"):
+            if cc_clf_source.startswith("60 US Inaugural"):
                 docs = load_inaugural_corpus()
                 texts = [d["text"] for d in docs]
                 eras = [d["era"] for d in docs]
@@ -3443,7 +3702,7 @@ print(clf.predict_proba(new_student))'''
                     + " — the 21st-century class is small because NLTK's corpus only goes "
                     "up to the most recent inauguration it was built with."
                 )
-            elif cc_clf_source.startswith("✍️"):
+            elif cc_clf_source.startswith("3,300+ passages"):
                 docs = load_author_passages_corpus()
                 texts = [d["text"] for d in docs]
                 eras = [d["author"] for d in docs]
@@ -3503,7 +3762,7 @@ print(clf.predict_proba(new_student))'''
                         st.error(f"Couldn't read that CSV: {e}")
 
             if len(texts) < 4 or len(set(eras)) < 2:
-                st.info("👆 Load a labeled corpus above to run classification.")
+                st.info("Load a labeled corpus above to run classification.")
             else:
                 test_size = st.slider("Test set fraction", 0.15, 0.4, 0.25, 0.05, key="cc_test_size")
 
@@ -3547,7 +3806,7 @@ print("Accuracy:", accuracy_score(y_test, preds))'''
                     result_df = pd.DataFrame({"Actual label": y_test, "Predicted label": preds})
                     st.dataframe(result_df, use_container_width=True, hide_index=True)
                     st.caption(
-                        f"💡 This is a **real, honestly computed** number on held-out data — "
+                        f"This is a **real, honestly computed** number on held-out data — "
                         "not a claimed or expected result. Re-run with a different test "
                         "fraction above and watch it change; with a small corpus, accuracy "
                         "is noisy from run to run."
@@ -3559,7 +3818,7 @@ print("Accuracy:", accuracy_score(y_test, preds))'''
         elif lesson_idx == 3:
             st.subheader("K-Means Clustering")
             st.markdown(
-                "<span class='badge badge-amber'>🔬 Clustering</span>",
+                "<span class='badge badge-amber'>Clustering</span>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -3612,7 +3871,7 @@ print("Accuracy:", accuracy_score(y_test, preds))'''
             st.pyplot(fig_elbow)
             plt.close(fig_elbow)
             st.caption(
-                "💡 Inertia always decreases as k increases (more clusters can only fit "
+                "Inertia always decreases as k increases (more clusters can only fit "
                 "the data at least as well) — the question is where it stops decreasing "
                 "*a lot*. Here the curve should bend noticeably around **k=3**, which "
                 "matches how this synthetic data was actually generated (3 groups) — a "
@@ -3657,7 +3916,7 @@ print(cluster_labels)'''
                     for i, c in enumerate(centers)
                 )
                 st.caption(
-                    f"💡 In plain terms: K-Means picked {k_numeric} center points (the black "
+                    f"In plain terms: K-Means picked {k_numeric} center points (the black "
                     f"X's) and assigned every point to whichever center is closest — "
                     f"{centers_txt}. With no labels at all, K-Means found these groups "
                     "purely from how close points are to each other. This is exactly what "
@@ -3680,14 +3939,14 @@ print(cluster_labels)'''
             cc_clust_source = st.radio(
                 "Text corpus",
                 [
-                    "🏛️ 60 US Inaugural Addresses (built-in, has real era labels to check against)",
-                    "📁 Your own documents (built-in corpus or upload)",
+                    "60 US Inaugural Addresses (built-in, has real era labels to check against)",
+                    "Your own documents (built-in corpus or upload)",
                 ],
                 key="cc_clust_source_choice",
                 horizontal=True,
             )
 
-            has_eras = cc_clust_source.startswith("🏛️")
+            has_eras = cc_clust_source.startswith("60 US Inaugural")
             if has_eras:
                 docs = load_inaugural_corpus()
                 texts = [d["text"] for d in docs]
@@ -3704,7 +3963,7 @@ print(cluster_labels)'''
             else:
                 max_k = min(6, len(texts))
 
-                with st.expander("📈 Not sure what k to pick? Check the elbow plot"):
+                with st.expander("Not sure what k to pick? Check the elbow plot"):
                     st.caption(
                         "Same idea as Part 1's elbow method, just run on TF-IDF vectors "
                         "instead of 2D points — this takes a few seconds since it fits "
@@ -3729,7 +3988,7 @@ print(cluster_labels)'''
                         st.pyplot(_fig)
                         plt.close(_fig)
                         st.caption(
-                            "💡 Look for where the curve stops dropping steeply. Real text "
+                            "Look for where the curve stops dropping steeply. Real text "
                             "data rarely has as clean a bend as the synthetic 2D points in "
                             "Part 1 — that's honest; text clustering is genuinely fuzzier."
                         )
@@ -3777,7 +4036,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                         )
                         st.dataframe(crosstab, use_container_width=True)
                         st.caption(
-                            "💡 Read this like a confusion matrix. If a cluster's row is concentrated "
+                            "Read this like a confusion matrix. If a cluster's row is concentrated "
                             "in one era column, K-Means found a grouping that lines up with real "
                             "history using **only word similarity, no labels**. If it's spread across "
                             "columns, clustering found some *other* structure (e.g. topic or length) "
@@ -3792,7 +4051,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                         })
                         st.dataframe(result_df, use_container_width=True, hide_index=True)
                         st.caption(
-                            "💡 No ground-truth labels here, so there's nothing to check clusters "
+                            "No ground-truth labels here, so there's nothing to check clusters "
                             "against — this just shows which of your documents K-Means grouped "
                             "together based on word similarity alone."
                         )
@@ -3804,7 +4063,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
     # -----------------------------------------------------------------------
     # QUICK TOOLS (Python)
     # -----------------------------------------------------------------------
-    elif mode == "⚡ Quick Tools":
+    elif mode == "Quick Tools":
         st.header("Quick Tools")
         st.caption(
             "**Load your text once — then run every tool on it.** Your text stays loaded "
@@ -3815,26 +4074,26 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
         # Inspired by Orange's Corpus widget: text is loaded ONCE into session
         # state and every downstream tool reads from it, instead of each tool
         # asking for its own input.
-        with st.expander("📄 **Your text** — paste, pick a sample, or upload a file", expanded=True):
+        with st.expander("**Your text** — paste, pick a sample, or upload a file", expanded=True):
             input_choice = st.radio(
                 "Where should the text come from?",
                 [
-                    "✍️ Paste my own text",
-                    "📚 Use a sample review",
-                    "📖 Public-domain classic",
-                    "📁 Upload a file",
+                    "Paste my own text",
+                    "Use a sample review",
+                    "Public-domain classic",
+                    "Upload a file",
                 ],
                 horizontal=True,
                 key="corpus_source",
             )
 
-            if input_choice == "📚 Use a sample review":
+            if input_choice == "Use a sample review":
                 chosen = st.selectbox("Pick a sample:", SAMPLE_REVIEWS["review"].tolist(), key="corpus_sample")
                 st.session_state.corpus_text = chosen
 
-            elif input_choice == "📖 Public-domain classic":
+            elif input_choice == "Public-domain classic":
                 st.caption(
-                    "📜 Every text here is **public domain** — free of copyright restrictions, "
+                    "Every text here is **public domain** — free of copyright restrictions, "
                     "so you can analyse, copy and reuse the output without limitation. "
                     "Loaded via NLTK's corpora; see CONTENT-LICENSES.md in the repo for provenance."
                 )
@@ -3854,7 +4113,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                 except Exception as e:
                     st.error(f"Couldn't load that text: {e}")
 
-            elif input_choice == "📁 Upload a file":
+            elif input_choice == "Upload a file":
                 uploaded = st.file_uploader(
                     "Upload a .txt, .csv or .pdf file",
                     type=["txt", "csv", "pdf"],
@@ -3881,7 +4140,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                                     f"{len(reader.pages)} page(s) of **{uploaded.name}**."
                                 )
                                 st.caption(
-                                    "⚠️ PDF extraction is approximate — a PDF stores the position "
+                                    "PDF extraction is approximate — a PDF stores the position "
                                     "of marks on a page, not clean text. Check the preview below."
                                 )
                         elif uploaded.name.lower().endswith(".csv"):
@@ -3940,7 +4199,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
             c1.metric("Characters", f"{n_chars:,}")
             c2.metric("Words (rough)", f"{n_words:,}")
             c3.metric("Sentences", f"{len(sent_tokenize(text)):,}")
-            with st.expander("👀 Preview loaded text"):
+            with st.expander("Preview loaded text"):
                 st.text(text[:2000] + ("\n\n...(truncated preview)" if len(text) > 2000 else ""))
         else:
             st.info("Load some text above to get started.")
@@ -3955,9 +4214,9 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
         # Modelled on Orange's "Preprocess Text" widget: the point is to make
         # preprocessing VISIBLE and ordered, showing what each stage removes,
         # rather than hiding it inside one opaque clean_text() call.
-        if tool == "🔧 Preprocessing Pipeline":
+        if tool == "Preprocessing Pipeline":
             st.markdown(
-                "<span class='badge badge-amber'>🔧 Foundational</span>",
+                "<span class='badge badge-amber'>Foundational</span>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -4026,7 +4285,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                         f"preprocessing removed **{pct:.0f}%** of them."
                     )
 
-                with st.expander("🔍 See the actual tokens at each stage"):
+                with st.expander("See the actual tokens at each stage"):
                     for name, count, toks in stages:
                         st.markdown(f"**{name}** ({count} tokens)")
                         st.write(toks[:60] + (["...(truncated)"] if len(toks) > 60 else []))
@@ -4068,7 +4327,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                 st.subheader("The exact code for the pipeline you just built")
                 st.code(pipeline_code, language="python")
                 st.download_button(
-                    "📥 Download this pipeline",
+                    "Download this pipeline",
                     data=pipeline_code,
                     file_name="preprocessing_pipeline.py",
                     mime="text/x-python",
@@ -4076,7 +4335,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                 )
 
                 st.info(
-                    "💡 **Order matters.** Removing stopwords *before* lowercasing misses "
+                    "**Order matters.** Removing stopwords *before* lowercasing misses "
                     "capitalized stopwords like \"The\". Stemming *before* stopword removal "
                     "can turn a word into something the stopword list no longer matches. "
                     "Try reordering mentally and predict what changes."
@@ -4090,7 +4349,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
                 # than hiding.
                 st.markdown("<div class='lib-section'></div>", unsafe_allow_html=True)
                 show_tfidf = st.checkbox(
-                    "🎯 Bonus: show TF-IDF weighting (scikit-learn)", key="pp_tfidf"
+                    "Bonus: show TF-IDF weighting (scikit-learn)", key="pp_tfidf"
                 )
                 if show_tfidf:
                     st.caption(
@@ -4138,20 +4397,20 @@ print(top10)'''
                     st.code(tfidf_code, language="python")
 
         # ===================== SENTIMENT ANALYSIS =====================
-        elif tool == "😊 Sentiment Analysis":
+        elif tool == "Sentiment Analysis":
             st.caption(
-                "🎓 New to sentiment analysis? See **Guided Learning → 📚 NLTK / ⚡ spaCy → "
+                "New to sentiment analysis? See **Guided Learning → NLTK / spaCy → "
                 "Sentiment** for a step-by-step explanation first."
             )
             st.markdown(
-                "<span class='badge badge-nltk'>📚 NLTK path</span>",
+                "<span class='badge badge-nltk'>NLTK path</span>",
                 unsafe_allow_html=True,
             )
             if text.strip():
                 sia = SentimentIntensityAnalyzer()
                 scores = sia.polarity_scores(text)
                 compound = scores["compound"]
-                label = "Positive 😊" if compound > 0.05 else "Negative 😞" if compound < -0.05 else "Neutral 😐"
+                label = "Positive " if compound > 0.05 else "Negative " if compound < -0.05 else "Neutral "
 
                 code = f'''# Setup (run once, e.g. in Colab):
 # import nltk
@@ -4171,7 +4430,7 @@ print(scores)'''
                     col_b.metric("Negative", f"{scores['neg']:.2f}")
                     col_c.metric("Compound", f"{compound:.2f}", help="Overall score from -1 (very negative) to +1 (very positive)")
                     st.caption(
-                        "💡 **VADER** (part of NLTK) is a lexicon-based sentiment tool tuned for "
+                        "**VADER** (part of NLTK) is a lexicon-based sentiment tool tuned for "
                         "short, informal text like reviews and social media."
                     )
 
@@ -4179,7 +4438,7 @@ print(scores)'''
 
             st.markdown(
                 "<div class='lib-section'></div>"
-                "<span class='badge badge-spacy'>⚡ spaCy path</span>",
+                "<span class='badge badge-spacy'>spaCy path</span>",
                 unsafe_allow_html=True,
             )
             nlp_spacy, spacy_ok = get_spacy_model()
@@ -4187,7 +4446,7 @@ print(scores)'''
                 st.error("spaCy couldn't load right now. Refresh and try again in a moment.")
             elif text.strip():
                 st.caption(
-                    "ℹ️ **Note:** spaCy doesn't ship built-in sentiment analysis. Real spaCy "
+                    "**Note:** spaCy doesn't ship built-in sentiment analysis. Real spaCy "
                     "projects typically add an extension like `spacytextblob`. This example "
                     "uses spaCy for tokenization/lemmatization plus a small illustrative "
                     "lexicon, so every number here is verifiable — not a spaCy built-in feature."
@@ -4197,7 +4456,7 @@ print(scores)'''
                 negative_words = {"terrible", "bad", "worst", "hate", "confusing", "boring"}
                 pos_count = sum(1 for t in doc if t.lemma_.lower() in positive_words)
                 neg_count = sum(1 for t in doc if t.lemma_.lower() in negative_words)
-                label_spacy = "Positive 😊" if pos_count > neg_count else "Negative 😞" if neg_count > pos_count else "Neutral 😐"
+                label_spacy = "Positive " if pos_count > neg_count else "Negative " if neg_count > pos_count else "Neutral "
 
                 code = f'''# Setup (run once, e.g. in Colab):
 # !pip install spacy
@@ -4222,20 +4481,20 @@ print("Positive:", pos_count, "| Negative:", neg_count)'''
                     col_a.metric("Positive words", pos_count)
                     col_b.metric("Negative words", neg_count)
                     st.caption(
-                        "💡 spaCy's `.lemma_` reduces words to their base form (e.g. "
+                        "spaCy's `.lemma_` reduces words to their base form (e.g. "
                         "\"loved\" → \"love\") before matching against the lexicon."
                     )
 
                 code_and_output(code, show_sentiment_output_spacy, key="tool_sentiment_spacy")
 
         # ===================== KEYWORD EXTRACTION =====================
-        elif tool == "🔑 Keyword Extraction":
+        elif tool == "Keyword Extraction":
             st.caption(
-                "🎓 New to keyword extraction? See **Guided Learning → 📚 NLTK / ⚡ spaCy → "
+                "New to keyword extraction? See **Guided Learning → NLTK / spaCy → "
                 "Keyword Extraction** for a step-by-step explanation first."
             )
             st.markdown(
-                "<span class='badge badge-nltk'>📚 NLTK path</span>",
+                "<span class='badge badge-nltk'>NLTK path</span>",
                 unsafe_allow_html=True,
             )
             if text.strip():
@@ -4270,7 +4529,7 @@ print(Counter(keywords).most_common(10))'''
 
             st.markdown(
                 "<div class='lib-section'></div>"
-                "<span class='badge badge-spacy'>⚡ spaCy path</span>",
+                "<span class='badge badge-spacy'>spaCy path</span>",
                 unsafe_allow_html=True,
             )
             nlp_spacy, spacy_ok = get_spacy_model()
@@ -4300,7 +4559,7 @@ print(Counter(keywords).most_common(10))'''
                         st.dataframe(kw_df, use_container_width=True, hide_index=True)
                         st.bar_chart(kw_df.set_index("Keyword (lemma)"))
                         st.caption(
-                            "💡 spaCy returns **lemmas** (base forms), e.g. \"loved\" → \"love\" — "
+                            "spaCy returns **lemmas** (base forms), e.g. \"loved\" → \"love\" — "
                             "slightly different from NLTK's raw-token approach."
                         )
                     else:
@@ -4309,10 +4568,10 @@ print(Counter(keywords).most_common(10))'''
                 code_and_output(code, show_keyword_output_spacy, key="tool_keywords_spacy")
 
         # ===================== NAMED ENTITY RECOGNITION =====================
-        elif tool == "🏷️ Named Entity Recognition":
+        elif tool == "Named Entity Recognition":
 
             st.markdown(
-                "<span class='badge badge-nltk'>📚 NLTK path</span>",
+                "<span class='badge badge-nltk'>NLTK path</span>",
                 unsafe_allow_html=True,
             )
             if text.strip():
@@ -4349,13 +4608,13 @@ for subtree in tree:
                         st.dataframe(ent_df, use_container_width=True, hide_index=True)
                     else:
                         st.info("No named entities detected in this text. Try text with names of people, places, or organizations.")
-                    st.caption("💡 NLTK's built-in chunker is lightweight — good for teaching, but less accurate than model-based approaches like the spaCy path.")
+                    st.caption("NLTK's built-in chunker is lightweight — good for teaching, but less accurate than model-based approaches like the spaCy path.")
 
                 code_and_output(code, show_ner_output_nltk, key="tool_ner_nltk")
 
             st.markdown(
                 "<div class='lib-section'></div>"
-                "<span class='badge badge-spacy'>⚡ spaCy path</span>",
+                "<span class='badge badge-spacy'>spaCy path</span>",
                 unsafe_allow_html=True,
             )
             nlp_spacy, spacy_ok = get_spacy_model()
@@ -4382,17 +4641,17 @@ for ent in doc.ents:
                         st.dataframe(ent_df, use_container_width=True, hide_index=True)
                     else:
                         st.info("No named entities detected in this text. Try text with names of people, places, or organizations.")
-                    st.caption("💡 spaCy uses a pretrained statistical model — generally more accurate than NLTK's rule-based chunker, especially on real-world text.")
+                    st.caption("spaCy uses a pretrained statistical model — generally more accurate than NLTK's rule-based chunker, especially on real-world text.")
 
                 code_and_output(code, show_ner_output_spacy, key="tool_ner_spacy")
 
-                st.markdown("**🎨 Entities highlighted in your text**")
+                st.markdown("**Entities highlighted in your text**")
                 render_entities(doc, key="viz_tool_ner")
 
         # ===================== WORD CLOUD =====================
-        elif tool == "☁️ Word Cloud":
+        elif tool == "Word Cloud":
             st.caption(
-                "🎓 See **Guided Learning → 📚 NLTK / ⚡ spaCy → Word Cloud** for the same "
+                "See **Guided Learning → NLTK / spaCy → Word Cloud** for the same "
                 "tool explained as a taught lesson first."
             )
             st.markdown(
@@ -4416,7 +4675,7 @@ for ent in doc.ents:
                 plt.close(fig)  # free memory — Streamlit Cloud's ceiling is ~1GB total
 
             st.markdown(
-                "<span class='badge badge-nltk'>📚 NLTK path</span>",
+                "<span class='badge badge-nltk'>NLTK path</span>",
                 unsafe_allow_html=True,
             )
             if text.strip():
@@ -4448,13 +4707,13 @@ plt.show()'''
 
                 def show_wc_nltk():
                     render_wordcloud(freq_wc_nltk, key="wc_nltk")
-                    st.caption(f"💡 Built from **{len(freq_wc_nltk)}** unique words after stopword removal.")
+                    st.caption(f"Built from **{len(freq_wc_nltk)}** unique words after stopword removal.")
 
                 code_and_output(code, show_wc_nltk, key="tool_wc_nltk")
 
             st.markdown(
                 "<div class='lib-section'></div>"
-                "<span class='badge badge-spacy'>⚡ spaCy path</span>",
+                "<span class='badge badge-spacy'>spaCy path</span>",
                 unsafe_allow_html=True,
             )
             nlp_spacy, spacy_ok = get_spacy_model()
@@ -4487,7 +4746,7 @@ plt.show()'''
                 def show_wc_spacy():
                     render_wordcloud(freq_wc_spacy, key="wc_spacy")
                     st.caption(
-                        f"💡 Built from **{len(freq_wc_spacy)}** unique lemmas — spaCy merges "
+                        f"Built from **{len(freq_wc_spacy)}** unique lemmas — spaCy merges "
                         "inflections (e.g. \"runs\"/\"running\"→\"run\") before counting, so this "
                         "cloud can look noticeably different from the NLTK one above."
                     )
@@ -4495,35 +4754,35 @@ plt.show()'''
                 code_and_output(code, show_wc_spacy, key="tool_wc_spacy")
 
         # ===================== CLASSIFICATION =====================
-        elif tool == "🧪 Classification":
+        elif tool == "Classification":
             st.markdown(
-                "<span class='badge badge-amber'>🧪 Machine Learning</span>",
+                "<span class='badge badge-amber'>Machine Learning</span>",
                 unsafe_allow_html=True,
             )
 
             clf_source = st.radio(
                 "Training data",
                 [
-                    "🎬 10 sample movie reviews (built-in)",
-                    "📁 Upload your own labeled CSV",
+                    "10 sample movie reviews (built-in)",
+                    "Upload your own labeled CSV",
                 ],
                 key="clf_source_choice",
                 horizontal=True,
             )
 
-            if clf_source.startswith("🎬"):
+            if clf_source.startswith("10 sample movie reviews"):
                 train_texts = SAMPLE_REVIEWS["review"].tolist()
                 train_labels = SAMPLE_REVIEWS["sentiment"].tolist()
                 st.warning(
-                    "⚠️ **Honesty check:** this trains on just **10 hand-labeled reviews** — "
+                    "**Honesty check:** this trains on just **10 hand-labeled reviews** — "
                     "enough to show *how* a classifier learns, nowhere near enough to be a "
                     "reliable real classifier. Production systems train on thousands to "
                     "millions of labeled examples. Treat every prediction below as a "
                     "demonstration, not a verdict. For a version trained on a real 60-document "
                     "corpus with a genuine train/test split and honest accuracy, see "
-                    "**🎓 Guided Learning → 🧪 Classification & Clustering**."
+                    "**Guided Learning → Classification & Clustering**."
                 )
-                with st.expander("📋 The training data (10 reviews, hand-labeled)"):
+                with st.expander("The training data (10 reviews, hand-labeled)"):
                     st.dataframe(SAMPLE_REVIEWS, use_container_width=True, hide_index=True)
             else:
                 st.caption(
@@ -4578,10 +4837,10 @@ plt.show()'''
             )
 
             if not train_texts:
-                st.info("👆 Load training data above to enable classification.")
+                st.info("Load training data above to enable classification.")
             else:
                 st.markdown(
-                    "<span class='badge badge-nltk'>📚 NLTK path — Naive Bayes</span>",
+                    "<span class='badge badge-nltk'>NLTK path — Naive Bayes</span>",
                     unsafe_allow_html=True,
                 )
                 if classify_input.strip():
@@ -4622,7 +4881,7 @@ print(classifier.classify(review_features(word_tokenize(new_text.lower()))))'''
                         st.bar_chart(prob_df.set_index("Label"))
                         top_conf = prob_df.iloc[0]
                         st.caption(
-                            f"💡 In plain terms: the model is **{top_conf['Probability']:.0%} "
+                            f"In plain terms: the model is **{top_conf['Probability']:.0%} "
                             f"confident** this text is **{top_conf['Label']}**, based purely "
                             f"on which of its words showed up anywhere in the "
                             f"{len(train_texts)} training examples for each label. NLTK's "
@@ -4635,7 +4894,7 @@ print(classifier.classify(review_features(word_tokenize(new_text.lower()))))'''
 
                 st.markdown(
                     "<div class='lib-section'></div>"
-                    "<span class='badge badge-spacy'>🔬 scikit-learn path — TF-IDF + Naive Bayes</span>",
+                    "<span class='badge badge-spacy'>scikit-learn path — TF-IDF + Naive Bayes</span>",
                     unsafe_allow_html=True,
                 )
                 if classify_input.strip():
@@ -4673,7 +4932,7 @@ print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
                         st.bar_chart(prob_df.set_index("Label"))
                         top_conf_sk = prob_df.iloc[0]
                         st.caption(
-                            f"💡 In plain terms: **{top_conf_sk['Probability']:.0%} "
+                            f"In plain terms: **{top_conf_sk['Probability']:.0%} "
                             f"confident** this text is **{top_conf_sk['Label']}**. This path "
                             "weights words by **TF-IDF** rather than plain presence — the "
                             "more standard real-world approach, and the same TfidfVectorizer "
@@ -4686,9 +4945,9 @@ print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
                     code_and_output(code, show_clf_sklearn, key="tool_clf_sklearn")
 
         # ===================== CLUSTERING =====================
-        elif tool == "🔬 Clustering":
+        elif tool == "Clustering":
             st.markdown(
-                "<span class='badge badge-amber'>🔬 Machine Learning</span>",
+                "<span class='badge badge-amber'>Machine Learning</span>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -4700,14 +4959,14 @@ print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
             clust_source = st.radio(
                 "Data source",
                 [
-                    "🎬 10 sample movie reviews (built-in)",
-                    "📁 Your own documents (built-in corpus or upload)",
+                    "10 sample movie reviews (built-in)",
+                    "Your own documents (built-in corpus or upload)",
                 ],
                 key="clust_source_choice",
                 horizontal=True,
             )
 
-            if clust_source.startswith("🎬"):
+            if clust_source.startswith("10 sample movie reviews"):
                 docs = SAMPLE_REVIEWS["review"].tolist()
                 doc_labels = [f"Review {i}" for i in range(len(docs))]
             else:
@@ -4792,7 +5051,7 @@ coords = PCA(n_components=2).fit_transform(X.toarray())'''
                 code_and_output(code, show_clustering, key="tool_clustering")
 
             st.info(
-                "💡 **Why PCA?** TF-IDF vectors have one dimension per vocabulary word — "
+                "**Why PCA?** TF-IDF vectors have one dimension per vocabulary word — "
                 "far more than 2 or 3, impossible to plot directly. PCA finds the two "
                 "directions of greatest variance and projects onto those, losing information "
                 "but making the clusters visually inspectable. K-Means itself runs on the "
@@ -4834,7 +5093,7 @@ else:
     # -----------------------------------------------------------------------
     # GUIDED LEARNING — Module 1: R Fundamentals (static examples)
     # -----------------------------------------------------------------------
-    if mode == "🎓 Guided Learning":
+    if mode == "Guided Learning":
         st.markdown(
             "<div class='module-head'><span class='badge badge-green'>R · Reference track</span>"
             "<h2>R Fundamentals</h2>"
@@ -4843,7 +5102,7 @@ else:
             unsafe_allow_html=True,
         )
         st.markdown(
-            "<div class='card'>📘 <b>R reference track.</b> Eight short lessons mirroring "
+            "<div class='card'><b>R reference track.</b> Eight short lessons mirroring "
             "the Python Fundamentals track. The code is real, standard R — but since this app "
             "runs on Python, output here is a precomputed, hand-verified worked example rather "
             "than live-executed. Copy the code into RStudio or Posit Cloud to experiment.<br><br>"
@@ -4870,12 +5129,12 @@ else:
                 "If Python is the generalist, R is the specialist statistician."
             )
             st.info(
-                "💡 R runs code the same way any programming language does — line by line, "
+                "R runs code the same way any programming language does — line by line, "
                 "in order. Its syntax differs from Python in small but important ways, like "
                 "using `<-` for assignment instead of `=`."
             )
 
-            with st.expander("🔍 Why R for NLP specifically?"):
+            with st.expander("Why R for NLP specifically?"):
                 st.markdown(
                     "R has a strong tradition in academic text analysis, especially through "
                     "packages like `tidytext` (tidyverse-style text mining), `quanteda` "
@@ -4884,7 +5143,7 @@ else:
                     "statistics research, you'll likely encounter R-based text analytics."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- R traditionally uses `<-` for assignment, not `=` (though `=` also "
                     "works in most contexts — `<-` is the convention).\n"
@@ -4898,7 +5157,7 @@ cat("Hello,", name, "- welcome to NLPPlayground!\\n")'''
 
             def show_r_intro():
                 st.code("Hello, Learner - welcome to NLPPlayground!", language="text")
-                st.caption("💡 `cat()` concatenates and prints text — one of the most common R output functions.")
+                st.caption("`cat()` concatenates and prints text — one of the most common R output functions.")
 
             code_and_output_r(code, show_r_intro, key="r_lesson0_intro")
             render_r_practice_box(
@@ -4920,18 +5179,18 @@ cat("Hello,", name, "- welcome to NLPPlayground!\\n")'''
                 "`numeric` (numbers), `character` (text), and `logical` (TRUE/FALSE)."
             )
             st.info(
-                "💡 R uses `<-` to assign values to variables. `class()` tells you the data "
+                "R uses `<-` to assign values to variables. `class()` tells you the data "
                 "type — R's equivalent of Python's `type()`."
             )
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Text in R is stored as `character` type. Sentiment scores from packages "
                     "like `tidytext` typically come back as `numeric`. Knowing which type "
                     "you're working with determines which functions you can apply to it."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- R's TRUE/FALSE must be written in ALL CAPS (or as `T`/`F`), unlike "
                     "Python's `True`/`False`.\n"
@@ -4977,9 +5236,9 @@ print(paste(word, word))    # "sentiment sentiment"'''
                 "R has built-in functions for inspecting and transforming text, similar in "
                 "spirit to Python's string methods but with different function names."
             )
-            st.info("💡 `nchar()` counts characters, `toupper()`/`tolower()` change case, `strsplit()` splits text into pieces.")
+            st.info("`nchar()` counts characters, `toupper()`/`tolower()` change case, `strsplit()` splits text into pieces.")
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Just like in Python, string operations are the entry point for every "
                     "R-based text analysis. Packages like `tidytext` build on top of these "
@@ -4987,7 +5246,7 @@ print(paste(word, word))    # "sentiment sentiment"'''
                     "splitting logic as `strsplit()` underneath."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- `strsplit()` returns a **list**, so you usually need `[[1]]` to get "
                     "the actual vector of pieces out.\n"
@@ -5032,9 +5291,9 @@ paste(rev(strsplit(s, "")[[1]]), collapse = "")  # reverse the string'''
                 "R's equivalent of a Python list is a **vector**, created with `c()` "
                 "(short for \"combine\"). Loops in R work much like Python's, using `for`."
             )
-            st.info("💡 A **vector** holds multiple values of the same type. `for` loops let you process each element in turn.")
+            st.info("A **vector** holds multiple values of the same type. `for` loops let you process each element in turn.")
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "R's `tidytext` and `quanteda` packages are optimized to work on entire "
                     "vectors of text at once (a whole document collection), often avoiding "
@@ -5042,7 +5301,7 @@ paste(rev(strsplit(s, "")[[1]]), collapse = "")  # reverse the string'''
                     "loop first makes the vectorized shortcuts easier to understand later."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- R vectors are **1-indexed** — the first item is `words[1]`, not `words[0]` "
                     "like Python. This trips up almost everyone coming from Python.\n"
@@ -5090,16 +5349,16 @@ cat("Longest word:", longest, "\\n")'''
                 "R's conditionals work the same way as Python's — the syntax just looks a "
                 "little different, using curly braces `{}` instead of indentation."
             )
-            st.info("💡 R uses `else if` (two words) where Python uses `elif` (one word) — a common trip-up when switching between the two.")
+            st.info("R uses `else if` (two words) where Python uses `elif` (one word) — a common trip-up when switching between the two.")
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Same as the Python track: turning a raw sentiment score into a readable "
                     "label like \"Positive\" or \"Negative\" is a conditional at its core, "
                     "whether you write it in R or Python."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- The `else` must go on the **same line** as the closing `}` of the "
                     "previous block, or R throws an error in scripts (this differs from "
@@ -5124,7 +5383,7 @@ print(label)'''
 
             def show_r_conditional():
                 st.code('[1] "Positive"', language="text")
-                st.caption("💡 Example uses a fixed score of 0.3 — copy the code and change the value to see other labels.")
+                st.caption("Example uses a fixed score of 0.3 — copy the code and change the value to see other labels.")
 
             code_and_output_r(code, show_r_conditional, key="r_lesson4_conditionals")
             render_r_practice_box(
@@ -5145,9 +5404,9 @@ print(label)'''
                 "R functions are defined with the `function()` keyword and use `return()` "
                 "(or simply the last evaluated line) to send back a value."
             )
-            st.info("💡 A **function** packages reusable logic — exactly like Python. Real R text-cleaning pipelines are built the same way.")
+            st.info("A **function** packages reusable logic — exactly like Python. Real R text-cleaning pipelines are built the same way.")
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "R-based NLP workflows (especially with `tidytext`) chain small functions "
                     "together using the pipe operator `%>%` or `|>`: clean text, tokenize, "
@@ -5155,7 +5414,7 @@ print(label)'''
                     "the same building block used throughout real R text-mining pipelines."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- Unlike Python, R functions **don't require** an explicit `return()` — "
                     "the last evaluated expression is returned automatically. Relying on this "
@@ -5202,11 +5461,11 @@ print(result)'''
                 "which behaves like a phonebook: look up a word, get its count."
             )
             st.info(
-                "💡 `table()` counts occurrences of each unique value in a vector — exactly "
+                "`table()` counts occurrences of each unique value in a vector — exactly "
                 "what you need for word-frequency counting, R's version of a dictionary lookup."
             )
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "Word frequency counting — what the Python **Keyword Extraction** tool "
                     "does with a dictionary — is done in R with `table()`. Sentiment lexicons "
@@ -5214,7 +5473,7 @@ print(result)'''
                     "usually implemented as named lists or named vectors in R."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- `table()` returns a special `table` object, not a plain named list — "
                     "use `as.list(table(...))` if you need list behavior specifically.\n"
@@ -5262,11 +5521,11 @@ cat("Count of the:", word_counts[["the"]], "\\n")'''
                 "library), data frames are a core part of base R itself."
             )
             st.info(
-                "💡 `data.frame()` builds a table from equal-length vectors — one vector per "
+                "`data.frame()` builds a table from equal-length vectors — one vector per "
                 "column, exactly like Python's `pd.DataFrame()` built from equal-length lists."
             )
 
-            with st.expander("🔍 Why this matters for NLP"):
+            with st.expander("Why this matters for NLP"):
                 st.markdown(
                     "R's `tidytext` and `quanteda` packages both return results as data "
                     "frames — a table of words, documents, and scores. Recognizing this "
@@ -5274,7 +5533,7 @@ cat("Count of the:", word_counts[["the"]], "\\n")'''
                     "of any real R text-analysis package."
                 )
 
-            with st.expander("⚠️ Common beginner mistakes"):
+            with st.expander("Common beginner mistakes"):
                 st.markdown(
                     "- All vectors passed into `data.frame()` must be the **same length**, "
                     "just like Python's DataFrame.\n"
@@ -5315,33 +5574,33 @@ print(df[order(-df$length), ])'''
 
         lesson_footer("R Fundamentals", lesson_idx, R_LESSONS, "nav_lesson_r")
 
-    elif mode == "⚡ Quick Tools":
+    elif mode == "Quick Tools":
         st.header("Quick Tools (R)")
         st.caption(
             "Real R code with precomputed, hand-verified example output — not live-executed. "
             "Pick a preset example below."
         )
         st.info(
-            "💡 **Want to analyse your own text, upload a file, or use a public-domain "
-            "corpus?** Switch the sidebar's language track to **🐍 Python** — those "
+            "**Want to analyse your own text, upload a file, or use a public-domain "
+            "corpus?** Switch the sidebar's language track to **Python** — those "
             "features need live execution, which only the Python track can do. The R code "
             "here is still fully correct and runnable in RStudio or Posit Cloud."
         )
 
         tool = st.selectbox(
             "Choose a tool",
-            ["😊 Sentiment Analysis", "🔑 Keyword Extraction", "🏷️ Named Entity Recognition (simplified)"],
+            ["Sentiment Analysis", "Keyword Extraction", "Named Entity Recognition (simplified)"],
         )
 
         st.markdown("---")
 
         # --- Sentiment ---
-        if tool == "😊 Sentiment Analysis":
+        if tool == "Sentiment Analysis":
             st.markdown(
                 "**Example text:** *\"I absolutely loved the new design of this app, it's clean and easy to use!\"*"
             )
             st.caption(
-                "💡 Production R sentiment analysis usually joins text against a lexicon like "
+                "Production R sentiment analysis usually joins text against a lexicon like "
                 "`tidytext`'s `bing` or `afinn` word lists. This example shows the same idea "
                 "with a small illustrative lexicon so the output can be verified by hand."
             )
@@ -5364,7 +5623,7 @@ sentiment <- ifelse(pos_count > neg_count, "Positive",
 cat("Sentiment:", sentiment, "\\n")'''
 
             def show_r_sentiment():
-                st.metric("Sentiment", "Positive 😊")
+                st.metric("Sentiment", "Positive ")
                 col_a, col_b = st.columns(2)
                 col_a.metric("Positive words found", 3)
                 col_b.metric("Negative words found", 0)
@@ -5373,12 +5632,12 @@ cat("Sentiment:", sentiment, "\\n")'''
             code_and_output_r(code, show_r_sentiment, key="r_tool_sentiment")
 
         # --- Keyword Extraction ---
-        elif tool == "🔑 Keyword Extraction":
+        elif tool == "Keyword Extraction":
             st.markdown(
                 "**Example text:** *\"I absolutely loved the new design of this app, it's clean and easy to use!\"*"
             )
             st.caption(
-                "💡 Real R keyword extraction typically uses `tidytext::unnest_tokens()` plus "
+                "Real R keyword extraction typically uses `tidytext::unnest_tokens()` plus "
                 "`anti_join()` against a stopword list. This simplified version uses base R "
                 "string splitting so every step is verifiable by hand."
             )
@@ -5410,7 +5669,7 @@ table(keywords)'''
                 "**Example text:** *\"Tim Cook visited Paris and met officials from Google.\"*"
             )
             st.caption(
-                "💡 Real R NER typically uses the `spacyr` or `udpipe` packages to call proper "
+                "Real R NER typically uses the `spacyr` or `udpipe` packages to call proper "
                 "NLP models. This simplified base-R version just detects capitalized word runs "
                 "as a teaching illustration — like NLTK's chunker on the Python side, it's not "
                 "production-accurate."

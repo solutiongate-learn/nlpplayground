@@ -6,4 +6,5 @@ pypdf>=4.0
 wordcloud>=1.9
 matplotlib>=3.8
 scikit-learn>=1.4
+gspread>=6.1
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
