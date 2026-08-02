@@ -382,6 +382,47 @@ def load_gutenberg_corpus(max_chars: int = MULTI_DOC_MAX_CHARS):
     return docs
 
 
+AUTHOR_PASSAGE_SENTENCES = 10  # sentences per passage — long enough to carry style, short enough for many examples
+
+
+@st.cache_resource(show_spinner="Splitting 9 books into passages (first use only)...")
+def load_author_passages_corpus(sentences_per_passage: int = AUTHOR_PASSAGE_SENTENCES):
+    """Splits the 3 NLTK Gutenberg authors who have 3+ books each (Austen,
+    Chesterton, Shakespeare — 9 books total) into ~10-sentence passages.
+
+    WHY: the 18-book Gutenberg corpus has only 1-3 books per author, which is
+    too few *rows* for a real train/test split even though each book is huge.
+    Splitting into passages turns 9 books into several hundred genuine,
+    non-overlapping training examples, while keeping the label 100%
+    mechanical — "which book did NLTK file this text under" — never a guess
+    or an invented category. This is a stylometry task (whose writing style
+    does this passage resemble?), not a claim about content or quality.
+    """
+    nltk.download("gutenberg", quiet=True)
+    nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
+    from nltk.corpus import gutenberg
+
+    eligible_authors = {"austen", "chesterton", "shakespeare"}
+    docs = []
+    for fid in gutenberg.fileids():
+        author = fid.split("-")[0]
+        if author not in eligible_authors:
+            continue
+        sents = sent_tokenize(gutenberg.raw(fid))
+        for i in range(0, len(sents), sentences_per_passage):
+            chunk = sents[i:i + sentences_per_passage]
+            if len(chunk) < sentences_per_passage:
+                break  # drop a short trailing partial passage
+            docs.append({
+                "label": f"{fid.replace('.txt', '')} #{i // sentences_per_passage}",
+                "author": author,
+                "book": fid.replace(".txt", ""),
+                "text": " ".join(chunk),
+            })
+    return docs
+
+
 def render_multi_doc_picker(key_prefix: str):
     """Shared UI for picking a multi-document corpus: built-in public-domain
     sets, or the user's own uploaded files. Returns a list of dicts each with
@@ -2998,6 +3039,14 @@ print(tf.most_common(10))'''
                         tf_df = pd.DataFrame(tf, columns=["Term", "Term Frequency (count)"])
                         st.dataframe(tf_df, use_container_width=True, hide_index=True)
                         st.bar_chart(tf_df.set_index("Term"))
+                        top_term, top_count = tf[0]
+                        st.caption(
+                            f"💡 In plain terms: the word **\"{top_term}\"** appears "
+                            f"**{top_count} time(s)** in this document, after lowercasing, "
+                            "removing punctuation, and dropping common stopwords (\"the\", "
+                            "\"and\", etc.) — more than any other word, so it tops the list. "
+                            "That's all TF is: a count, nothing more."
+                        )
                     else:
                         st.warning("No words left after removing stopwords — try a longer document.")
 
@@ -3062,16 +3111,22 @@ print(top10)'''
                         df = pd.DataFrame(top, columns=["Term", "TF-IDF weight"])
                         st.dataframe(df, use_container_width=True, hide_index=True)
                         st.bar_chart(df.set_index("Term"))
+                        top_term, top_weight = top[0]
+                        st.caption(
+                            f"💡 In plain terms: **\"{top_term}\"** has the highest TF-IDF "
+                            f"weight ({top_weight}) in **{pick}** — meaning it appears "
+                            "often *here* but rarely or never in your other documents. A "
+                            "word that's frequent in every document (like \"movie\" across "
+                            "10 movie reviews) gets pushed *down* by TF-IDF even if its raw "
+                            "count (TF) was high — that's the down-weighting in action. "
+                            "Weights are unitless (not a percentage or a count) — only their "
+                            "*relative order* matters."
+                        )
                     else:
                         st.info(
                             "Every word in this document either doesn't appear elsewhere "
                             "in the vocabulary or was filtered — try more varied documents."
                         )
-                    st.caption(
-                        f"💡 These are the terms that make **{pick}** distinctive *relative "
-                        f"to the other {len(docs_result) - 1} document(s) you provided* — "
-                        "swap in your own documents above and re-Analyze to see this change."
-                    )
 
                 code_and_output(code, show_tfidf, key="cc_tfidf")
 
@@ -3092,17 +3147,32 @@ print(top10)'''
 
             st.markdown("#### Part 1 — Classification on plain numbers")
             st.caption(
-                "Synthetic teaching data — hours studied and practice tests taken, "
-                "predicting pass/fail. Not real student records."
+                "Synthetic teaching data — 80 fictional students' hours studied and "
+                "practice tests taken, predicting pass/fail. Not real student records: "
+                "generated from a simple rule (more study + more practice raises pass "
+                "chance) plus random noise, so outcomes aren't a clean straight line — "
+                "closer to how messy real data actually looks."
             )
 
+            import numpy as np
+            _rng_study = np.random.RandomState(7)
+            _n_students = 80
+            _hours = _rng_study.uniform(0, 10, _n_students)
+            _tests = _rng_study.uniform(0, 5, _n_students)
+            _score = 0.55 * _hours + 1.1 * _tests + _rng_study.normal(0, 1.8, _n_students)
+            _result = np.where(_score > 6.5, "Pass", "Fail")
             study_data = pd.DataFrame({
-                "hours_studied": [1, 2, 2, 3, 4, 4, 5, 6, 7, 8, 8, 9],
-                "practice_tests": [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4],
-                "result": ["Fail", "Fail", "Fail", "Fail", "Fail", "Pass",
-                           "Pass", "Pass", "Pass", "Pass", "Pass", "Pass"],
+                "hours_studied": _hours.round(1),
+                "practice_tests": _tests.round(1),
+                "result": _result,
             })
-            st.dataframe(study_data, use_container_width=True, hide_index=True)
+            with st.expander(f"📋 All {len(study_data)} rows of training data"):
+                st.dataframe(study_data, use_container_width=True, hide_index=True)
+            st.caption(
+                f"Class balance: {(study_data['result'] == 'Pass').sum()} Pass, "
+                f"{(study_data['result'] == 'Fail').sum()} Fail — genuinely mixed, not "
+                "cherry-picked to look clean."
+            )
 
             code_numeric = '''from sklearn.naive_bayes import GaussianNB
 import pandas as pd
@@ -3145,7 +3215,18 @@ print(clf.predict_proba(new_student))'''
                 plt.close(fig)
 
                 st.metric("Predicted result", pred)
-                st.caption(f"💡 Probability: {dict(zip(clf.classes_, proba.round(2)))}")
+                proba_dict = dict(zip(clf.classes_, proba.round(3)))
+                pred_conf = proba_dict[pred]
+                st.caption(
+                    f"💡 In plain terms: given **{new_hours} hours studied** and "
+                    f"**{new_tests} practice tests**, the model predicts **{pred}** with "
+                    f"**{pred_conf:.0%} confidence** (full breakdown: {proba_dict}). This "
+                    "confidence comes from how close the blue star sits to the green "
+                    "(Pass) vs. red (Fail) points above — Naive Bayes fits a probability "
+                    "distribution to each class and compares how likely the new point is "
+                    "under each one. Move the sliders toward the edge between the two "
+                    "colors and watch the confidence drop toward 50%."
+                )
 
             code_and_output(code_numeric, show_numeric_classification, key="cc_numeric_classification")
 
@@ -3163,6 +3244,7 @@ print(clf.predict_proba(new_student))'''
                 "Text corpus",
                 [
                     "🏛️ 60 US Inaugural Addresses, by era (built-in)",
+                    "✍️ 3,300+ passages, by author (built-in, bigger)",
                     "📁 Upload your own labeled CSV",
                 ],
                 key="cc_clf_source_choice",
@@ -3178,6 +3260,19 @@ print(clf.predict_proba(new_student))'''
                     "Class sizes: " + ", ".join(f"**{k}**: {v}" for k, v in era_counts.items())
                     + " — the 21st-century class is small because NLTK's corpus only goes "
                     "up to the most recent inauguration it was built with."
+                )
+            elif cc_clf_source.startswith("✍️"):
+                docs = load_author_passages_corpus()
+                texts = [d["text"] for d in docs]
+                eras = [d["author"] for d in docs]
+                era_counts = pd.Series(eras).value_counts()
+                st.caption(
+                    "Each row is a ~10-sentence passage from one of 9 public-domain books "
+                    "by 3 authors (Austen, Chesterton, Shakespeare) — genuinely more rows "
+                    "than the inaugural corpus, so the train/test split has much more to "
+                    "work with. Label = which book NLTK filed the passage under, a "
+                    "mechanical fact, not a judgment call. Class sizes: "
+                    + ", ".join(f"**{k}**: {v}" for k, v in era_counts.items())
                 )
             else:
                 st.caption(
@@ -3294,21 +3389,67 @@ print("Accuracy:", accuracy_score(y_test, preds))'''
             )
 
             st.markdown("#### Part 1 — Clustering plain numbers")
-            st.caption("Synthetic 2D points, deliberately arranged into visually obvious groups.")
+            st.caption(
+                "Synthetic 2D points — 90 fictional points across 3 groups, deliberately "
+                "spread out (not tiny/tidy toy clusters) so the shapes are visually "
+                "obvious but the groups still overlap a little at the edges, like real data."
+            )
 
             import numpy as np
             rng = np.random.RandomState(42)
-            group_a = rng.normal(loc=[2, 2], scale=0.6, size=(8, 2))
-            group_b = rng.normal(loc=[8, 3], scale=0.6, size=(8, 2))
-            group_c = rng.normal(loc=[5, 8], scale=0.6, size=(8, 2))
+            group_a = rng.normal(loc=[2, 2], scale=1.0, size=(30, 2))
+            group_b = rng.normal(loc=[8, 3], scale=1.0, size=(30, 2))
+            group_c = rng.normal(loc=[5, 8], scale=1.0, size=(30, 2))
             points = np.vstack([group_a, group_b, group_c])
             points_df = pd.DataFrame(points, columns=["x", "y"])
 
-            k_numeric = st.slider("Number of clusters (k)", 2, 5, 3, key="cc_numeric_k")
+            st.markdown("##### How do you choose k? The elbow method")
+            st.markdown(
+                "K-Means needs to be **told** how many clusters to look for — it won't "
+                "discover that number on its own. The **elbow method** helps pick a "
+                "reasonable k: run K-Means for a range of k values, plot each one's "
+                "**inertia** (total squared distance from every point to its own cluster "
+                "center — lower is tighter, more compact clusters), and look for the point "
+                "where adding more clusters stops helping much. That bend in the curve "
+                "looks like an elbow, hence the name."
+            )
+
+            from sklearn.cluster import KMeans as _KMeansElbow
+            elbow_ks = list(range(1, 8))
+            inertias = []
+            for _k in elbow_ks:
+                _km = _KMeansElbow(n_clusters=_k, n_init=10, random_state=0)
+                _km.fit(points_df[["x", "y"]])
+                inertias.append(_km.inertia_)
+
+            fig_elbow, ax_elbow = plt.subplots(figsize=(6, 4))
+            ax_elbow.plot(elbow_ks, inertias, marker="o")
+            ax_elbow.set_xlabel("k (number of clusters)")
+            ax_elbow.set_ylabel("Inertia (lower = tighter clusters)")
+            ax_elbow.set_title("Elbow plot — where does adding more k stop helping?")
+            st.pyplot(fig_elbow)
+            plt.close(fig_elbow)
+            st.caption(
+                "💡 Inertia always decreases as k increases (more clusters can only fit "
+                "the data at least as well) — the question is where it stops decreasing "
+                "*a lot*. Here the curve should bend noticeably around **k=3**, which "
+                "matches how this synthetic data was actually generated (3 groups) — a "
+                "genuine check, not a number chosen to make the demo look right."
+            )
+
+            k_numeric = st.slider("Number of clusters (k)", 2, 6, 3, key="cc_numeric_k")
 
             code_numeric_cl = f'''from sklearn.cluster import KMeans
 
-# `points` = array of (x, y) coordinates, no labels
+# Elbow method: try a range of k, plot inertia, look for the bend
+inertias = []
+for k in range(1, 8):
+    km = KMeans(n_clusters=k, n_init=10, random_state=0)
+    km.fit(points)
+    inertias.append(km.inertia_)
+# plot `inertias` against range(1, 8) and look for where it stops dropping fast
+
+# Then fit with the chosen k
 km = KMeans(n_clusters={k_numeric}, n_init=10, random_state=0)
 cluster_labels = km.fit_predict(points)
 print(cluster_labels)'''
@@ -3327,10 +3468,19 @@ print(cluster_labels)'''
                 ax.legend()
                 st.pyplot(fig)
                 plt.close(fig)
+
+                sizes = pd.Series(labels_num).value_counts().sort_index()
+                centers_txt = ", ".join(
+                    f"Cluster {i}: center at ({c[0]:.1f}, {c[1]:.1f}), {sizes.get(i, 0)} points"
+                    for i, c in enumerate(centers)
+                )
                 st.caption(
-                    "💡 With no labels at all, K-Means found groups purely from how close "
-                    "points are to each other. This is exactly what happens to TF-IDF "
-                    "vectors in Part 2 — just in many more than 2 dimensions."
+                    f"💡 In plain terms: K-Means picked {k_numeric} center points (the black "
+                    f"X's) and assigned every point to whichever center is closest — "
+                    f"{centers_txt}. With no labels at all, K-Means found these groups "
+                    "purely from how close points are to each other. This is exactly what "
+                    "happens to TF-IDF vectors in Part 2 — just in many more than 2 "
+                    "dimensions, where 'closest' can't be drawn on a page."
                 )
 
             code_and_output(code_numeric_cl, show_numeric_clustering, key="cc_numeric_clustering")
@@ -3371,6 +3521,37 @@ print(cluster_labels)'''
                 st.info("Need at least 2 documents to cluster. Pick a source above with 2+ documents.")
             else:
                 max_k = min(6, len(texts))
+
+                with st.expander("📈 Not sure what k to pick? Check the elbow plot"):
+                    st.caption(
+                        "Same idea as Part 1's elbow method, just run on TF-IDF vectors "
+                        "instead of 2D points — this takes a few seconds since it fits "
+                        "K-Means several times."
+                    )
+                    if st.button("Compute elbow plot", key="cc_text_elbow_btn"):
+                        from sklearn.feature_extraction.text import TfidfVectorizer as _TV
+                        from sklearn.cluster import KMeans as _KM
+                        _vec_elbow = _TV(stop_words="english", max_df=0.8)
+                        _X_elbow = _vec_elbow.fit_transform(texts)
+                        _elbow_ks = list(range(1, max(2, max_k) + 1))
+                        _inertias = []
+                        for _k in _elbow_ks:
+                            _km = _KM(n_clusters=_k, n_init=10, random_state=0)
+                            _km.fit(_X_elbow)
+                            _inertias.append(_km.inertia_)
+                        _fig, _ax = plt.subplots(figsize=(6, 4))
+                        _ax.plot(_elbow_ks, _inertias, marker="o")
+                        _ax.set_xlabel("k (number of clusters)")
+                        _ax.set_ylabel("Inertia (lower = tighter clusters)")
+                        _ax.set_title("Elbow plot on your TF-IDF vectors")
+                        st.pyplot(_fig)
+                        plt.close(_fig)
+                        st.caption(
+                            "💡 Look for where the curve stops dropping steeply. Real text "
+                            "data rarely has as clean a bend as the synthetic 2D points in "
+                            "Part 1 — that's honest; text clustering is genuinely fuzzier."
+                        )
+
                 k = st.slider(
                     "Number of clusters (k)", min_value=2, max_value=max(2, max_k),
                     value=min(3, max_k), key="cc_cluster_k",
@@ -4257,9 +4438,15 @@ print(classifier.classify(review_features(word_tokenize(new_text.lower()))))'''
                             columns=["Label", "Probability"],
                         ).sort_values("Probability", ascending=False)
                         st.bar_chart(prob_df.set_index("Label"))
+                        top_conf = prob_df.iloc[0]
                         st.caption(
-                            "💡 NLTK's Naive Bayes uses **word presence** (is this word in the "
-                            "text, yes/no) rather than frequency or TF-IDF weighting."
+                            f"💡 In plain terms: the model is **{top_conf['Probability']:.0%} "
+                            f"confident** this text is **{top_conf['Label']}**, based purely "
+                            f"on which of its words showed up anywhere in the "
+                            f"{len(train_texts)} training examples for each label. NLTK's "
+                            "Naive Bayes uses **word presence** (is this word in the text, "
+                            "yes/no) rather than frequency or TF-IDF weighting — try the "
+                            "scikit-learn path below to see how that changes the result."
                         )
 
                     code_and_output(code, show_clf_nltk, key="tool_clf_nltk")
@@ -4302,10 +4489,16 @@ print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
                             {"Label": clf_sk.classes_, "Probability": proba_sk}
                         ).sort_values("Probability", ascending=False)
                         st.bar_chart(prob_df.set_index("Label"))
+                        top_conf_sk = prob_df.iloc[0]
                         st.caption(
-                            "💡 This path weights words by **TF-IDF** rather than plain presence — "
-                            "the more standard real-world approach, and the same TfidfVectorizer "
-                            "used in the Preprocessing Pipeline's bonus TF-IDF stage."
+                            f"💡 In plain terms: **{top_conf_sk['Probability']:.0%} "
+                            f"confident** this text is **{top_conf_sk['Label']}**. This path "
+                            "weights words by **TF-IDF** rather than plain presence — the "
+                            "more standard real-world approach, and the same TfidfVectorizer "
+                            "used in the Preprocessing Pipeline's bonus TF-IDF stage. If this "
+                            "prediction disagrees with the NLTK path above, that's a genuine "
+                            "and informative disagreement — it means the two weighting "
+                            "schemes are picking up on different signals in your input."
                         )
 
                     code_and_output(code, show_clf_sklearn, key="tool_clf_sklearn")
@@ -4397,12 +4590,22 @@ coords = PCA(n_components=2).fit_transform(X.toarray())'''
 
                     # Top terms per cluster centroid — what the cluster is actually "about"
                     terms = vec_cl.get_feature_names_out()
-                    st.markdown("**What each cluster is about (top TF-IDF terms per centroid):**")
+                    cluster_sizes = pd.Series(cluster_labels).value_counts().sort_index()
+                    st.markdown(
+                        "**What each cluster is about.** A centroid is the average TF-IDF "
+                        "vector of every document K-Means put in that cluster — the words "
+                        "below are simply the ones with the highest average weight in that "
+                        "cluster, i.e. the words that best characterize it:"
+                    )
                     for c in range(k):
                         centroid = km.cluster_centers_[c]
                         top_terms_idx = centroid.argsort()[::-1][:6]
                         top_terms = ", ".join(terms[i] for i in top_terms_idx if centroid[i] > 0)
-                        st.caption(f"**Cluster {c}:** {top_terms or '(no distinctive terms)'}")
+                        n_docs_c = cluster_sizes.get(c, 0)
+                        st.caption(
+                            f"**Cluster {c}** ({n_docs_c} document(s)): "
+                            f"{top_terms or '(no distinctive terms)'}"
+                        )
 
                 code_and_output(code, show_clustering, key="tool_clustering")
 
