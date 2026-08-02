@@ -3153,33 +3153,91 @@ print(clf.predict_proba(new_student))'''
             st.markdown("#### Part 2 — The same idea, applied to text")
             st.markdown(
                 "**Classification** predicts a label for new text, learned from labeled "
-                "examples. The Quick Tools version demonstrates this on 10 hand-labeled "
-                "movie reviews — good for seeing the mechanism, too small for a real "
-                "train/test split. Here we classify all **60 inaugural addresses** by "
+                "examples. By default, this classifies all **60 inaugural addresses** by "
                 "**era** (19th / 20th / 21st century) — a real label taken mechanically "
-                "from each speech's year, split into genuine train and test sets."
+                "from each speech's year, split into genuine train and test sets. Or upload "
+                "your own labeled CSV to run the exact same pipeline on your own data."
             )
 
-            docs = load_inaugural_corpus()
-            texts = [d["text"] for d in docs]
-            eras = [d["era"] for d in docs]
-            era_counts = pd.Series(eras).value_counts()
-            st.caption(
-                "Class sizes: " + ", ".join(f"**{k}**: {v}" for k, v in era_counts.items())
-                + " — the 21st-century class is small because NLTK's corpus only goes "
-                "up to the most recent inauguration it was built with."
+            cc_clf_source = st.radio(
+                "Text corpus",
+                [
+                    "🏛️ 60 US Inaugural Addresses, by era (built-in)",
+                    "📁 Upload your own labeled CSV",
+                ],
+                key="cc_clf_source_choice",
+                horizontal=True,
             )
 
-            test_size = st.slider("Test set fraction", 0.15, 0.4, 0.25, 0.05, key="cc_test_size")
+            if cc_clf_source.startswith("🏛️"):
+                docs = load_inaugural_corpus()
+                texts = [d["text"] for d in docs]
+                eras = [d["era"] for d in docs]
+                era_counts = pd.Series(eras).value_counts()
+                st.caption(
+                    "Class sizes: " + ", ".join(f"**{k}**: {v}" for k, v in era_counts.items())
+                    + " — the 21st-century class is small because NLTK's corpus only goes "
+                    "up to the most recent inauguration it was built with."
+                )
+            else:
+                st.caption(
+                    "Upload a CSV with **one text column and one label column**. Classification "
+                    "needs real labels to learn from and check accuracy against — a plain "
+                    "PDF/text upload has no labels, so it can't be used to train or honestly "
+                    "evaluate a classifier (that's exactly what Clustering, below, is for)."
+                )
+                cc_clf_csv = st.file_uploader(
+                    "CSV file", type=["csv"], key="cc_clf_csv_upload",
+                    help="Nothing is stored — processed in memory only.",
+                )
+                texts, eras = [], []
+                if cc_clf_csv is not None:
+                    try:
+                        df_cc = pd.read_csv(cc_clf_csv)
+                        if df_cc.empty:
+                            st.warning("That CSV appears to be empty.")
+                        else:
+                            all_cols = df_cc.columns.tolist()
+                            c1, c2 = st.columns(2)
+                            text_col = c1.selectbox("Text column", all_cols, key="cc_clf_text_col")
+                            label_col = c2.selectbox(
+                                "Label column", all_cols,
+                                index=min(1, len(all_cols) - 1), key="cc_clf_label_col",
+                            )
+                            clean = df_cc[[text_col, label_col]].dropna()
+                            texts = clean[text_col].astype(str).tolist()
+                            eras = clean[label_col].astype(str).tolist()
+                            class_counts = pd.Series(eras).value_counts()
+                            if len(texts) < 10 or len(class_counts) < 2 or class_counts.min() < 2:
+                                st.warning(
+                                    f"Found {len(texts)} labeled row(s) across {len(class_counts)} "
+                                    "class(es). Need at least ~10 rows across 2+ classes, with at "
+                                    "least 2 examples per class, for a train/test split to be "
+                                    "meaningful."
+                                )
+                                texts, eras = [], []
+                            else:
+                                st.success(
+                                    f"Loaded **{len(texts)} labeled rows**, "
+                                    f"**{len(class_counts)} classes**: "
+                                    + ", ".join(f"{k} ({v})" for k, v in class_counts.items())
+                                )
+                    except Exception as e:
+                        st.error(f"Couldn't read that CSV: {e}")
 
-            code = f'''from sklearn.feature_extraction.text import TfidfVectorizer
+            if len(texts) < 4 or len(set(eras)) < 2:
+                st.info("👆 Load a labeled corpus above to run classification.")
+            else:
+                test_size = st.slider("Test set fraction", 0.15, 0.4, 0.25, 0.05, key="cc_test_size")
+
+                code = f'''from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-# X = 60 speech texts, y = era labels ("19th century", "20th century", "21st century")
+# X = document texts, y = labels
 X_train, X_test, y_train, y_test = train_test_split(
-    speeches, eras, test_size={test_size}, random_state=0, stratify=eras
+    texts, labels, test_size={test_size}, random_state=0, stratify=labels
 )
 
 vec = TfidfVectorizer(stop_words="english", max_df=0.8)
@@ -3191,34 +3249,34 @@ clf.fit(X_train_vec, y_train)
 preds = clf.predict(X_test_vec)
 print("Accuracy:", accuracy_score(y_test, preds))'''
 
-            def show_classification():
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                from sklearn.naive_bayes import MultinomialNB
-                from sklearn.model_selection import train_test_split
-                from sklearn.metrics import accuracy_score
+                def show_classification():
+                    from sklearn.feature_extraction.text import TfidfVectorizer
+                    from sklearn.naive_bayes import MultinomialNB
+                    from sklearn.model_selection import train_test_split
+                    from sklearn.metrics import accuracy_score
 
-                X_train, X_test, y_train, y_test = train_test_split(
-                    texts, eras, test_size=test_size, random_state=0, stratify=eras
-                )
-                vec = TfidfVectorizer(stop_words="english", max_df=0.8)
-                X_train_vec = vec.fit_transform(X_train)
-                X_test_vec = vec.transform(X_test)
-                clf = MultinomialNB()
-                clf.fit(X_train_vec, y_train)
-                preds = clf.predict(X_test_vec)
-                acc = accuracy_score(y_test, preds)
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        texts, eras, test_size=test_size, random_state=0, stratify=eras
+                    )
+                    vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+                    X_train_vec = vec.fit_transform(X_train)
+                    X_test_vec = vec.transform(X_test)
+                    clf = MultinomialNB()
+                    clf.fit(X_train_vec, y_train)
+                    preds = clf.predict(X_test_vec)
+                    acc = accuracy_score(y_test, preds)
 
-                st.metric("Test accuracy", f"{acc:.0%}", help=f"Computed on {len(y_test)} held-out speeches")
-                result_df = pd.DataFrame({"Actual era": y_test, "Predicted era": preds})
-                st.dataframe(result_df, use_container_width=True, hide_index=True)
-                st.caption(
-                    f"💡 This is a **real, honestly computed** number on held-out data — "
-                    "not a claimed or expected result. Re-run with a different test "
-                    "fraction above and watch it change; with only 60 documents, accuracy "
-                    "is noisy from run to run."
-                )
+                    st.metric("Test accuracy", f"{acc:.0%}", help=f"Computed on {len(y_test)} held-out documents")
+                    result_df = pd.DataFrame({"Actual label": y_test, "Predicted label": preds})
+                    st.dataframe(result_df, use_container_width=True, hide_index=True)
+                    st.caption(
+                        f"💡 This is a **real, honestly computed** number on held-out data — "
+                        "not a claimed or expected result. Re-run with a different test "
+                        "fraction above and watch it change; with a small corpus, accuracy "
+                        "is noisy from run to run."
+                    )
 
-            code_and_output(code, show_classification, key="cc_classification")
+                code_and_output(code, show_classification, key="cc_classification")
 
         # --- Lesson 3: K-Means Clustering ---
         elif lesson_idx == 3:
@@ -3280,62 +3338,103 @@ print(cluster_labels)'''
             st.markdown("<div class='lib-section'></div>", unsafe_allow_html=True)
             st.markdown("#### Part 2 — The same idea, applied to text")
             st.markdown(
-                "We'll cluster the same 60 inaugural addresses and then check, honestly, "
-                "how well the *unsupervised* clusters line up with the *real* eras from "
-                "the previous lesson."
+                "By default, this clusters the same 60 inaugural addresses and then checks, "
+                "honestly, how well the *unsupervised* clusters line up with the *real* eras "
+                "from the previous lesson. Clustering needs no labels at all, so you can also "
+                "point it at your own documents — built-in corpora or an upload, same as "
+                "the Preprocessing Pipeline's corpus picker."
             )
 
-            docs = load_inaugural_corpus()
-            texts = [d["text"] for d in docs]
-            eras = [d["era"] for d in docs]
-            labels_disp = [d["label"] for d in docs]
-            k = st.slider("Number of clusters (k)", 2, 6, 3, key="cc_cluster_k")
+            cc_clust_source = st.radio(
+                "Text corpus",
+                [
+                    "🏛️ 60 US Inaugural Addresses (built-in, has real era labels to check against)",
+                    "📁 Your own documents (built-in corpus or upload)",
+                ],
+                key="cc_clust_source_choice",
+                horizontal=True,
+            )
 
-            code = f'''from sklearn.feature_extraction.text import TfidfVectorizer
+            has_eras = cc_clust_source.startswith("🏛️")
+            if has_eras:
+                docs = load_inaugural_corpus()
+                texts = [d["text"] for d in docs]
+                eras = [d["era"] for d in docs]
+                labels_disp = [d["label"] for d in docs]
+            else:
+                picked = render_multi_doc_picker(key_prefix="cc_clust_tool")
+                texts = [d["text"] for d in picked]
+                labels_disp = [d["label"] for d in picked]
+                eras = None
+
+            if len(texts) < 2:
+                st.info("Need at least 2 documents to cluster. Pick a source above with 2+ documents.")
+            else:
+                max_k = min(6, len(texts))
+                k = st.slider(
+                    "Number of clusters (k)", min_value=2, max_value=max(2, max_k),
+                    value=min(3, max_k), key="cc_cluster_k",
+                )
+
+                code = f'''from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
 vec = TfidfVectorizer(stop_words="english", max_df=0.8)
-X = vec.fit_transform(speeches)                 # 60 documents -> TF-IDF vectors
+X = vec.fit_transform(documents)                 # N documents -> TF-IDF vectors
 km = KMeans(n_clusters={k}, n_init=10, random_state=0)
 cluster_labels = km.fit_predict(X)
 
 coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
 
-            def show_clustering_cc():
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                from sklearn.cluster import KMeans
-                from sklearn.decomposition import PCA
+                def show_clustering_cc():
+                    from sklearn.feature_extraction.text import TfidfVectorizer
+                    from sklearn.cluster import KMeans
+                    from sklearn.decomposition import PCA
 
-                vec = TfidfVectorizer(stop_words="english", max_df=0.8)
-                X = vec.fit_transform(texts)
-                km = KMeans(n_clusters=k, n_init=10, random_state=0)
-                cluster_labels = km.fit_predict(X)
-                coords = PCA(n_components=2, random_state=0).fit_transform(X.toarray())
+                    vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+                    X = vec.fit_transform(texts)
+                    km = KMeans(n_clusters=k, n_init=10, random_state=0)
+                    cluster_labels = km.fit_predict(X)
+                    coords = PCA(n_components=2, random_state=0).fit_transform(X.toarray())
 
-                fig, ax = plt.subplots(figsize=(7, 5))
-                ax.scatter(coords[:, 0], coords[:, 1], c=cluster_labels, cmap="tab10", s=90, edgecolors="black")
-                ax.set_xlabel("PCA component 1")
-                ax.set_ylabel("PCA component 2")
-                ax.set_title(f"K-Means clusters of 60 inaugural addresses (k={k})")
-                st.pyplot(fig)
-                plt.close(fig)
+                    fig, ax = plt.subplots(figsize=(7, 5))
+                    ax.scatter(coords[:, 0], coords[:, 1], c=cluster_labels, cmap="tab10", s=90, edgecolors="black")
+                    ax.set_xlabel("PCA component 1")
+                    ax.set_ylabel("PCA component 2")
+                    ax.set_title(f"K-Means clusters of {len(texts)} document(s) (k={k})")
+                    st.pyplot(fig)
+                    plt.close(fig)
 
-                st.markdown("**Does clustering (unsupervised) recover era (the real label)?**")
-                crosstab = pd.crosstab(
-                    pd.Series(cluster_labels, name="Cluster"),
-                    pd.Series(eras, name="Actual era"),
-                )
-                st.dataframe(crosstab, use_container_width=True)
-                st.caption(
-                    "💡 Read this like a confusion matrix. If a cluster's row is concentrated "
-                    "in one era column, K-Means found a grouping that lines up with real "
-                    "history using **only word similarity, no labels**. If it's spread across "
-                    "columns, clustering found some *other* structure (e.g. topic or length) "
-                    "that doesn't match era — an honest, possible outcome, not a failure to hide."
-                )
+                    if has_eras:
+                        st.markdown("**Does clustering (unsupervised) recover era (the real label)?**")
+                        crosstab = pd.crosstab(
+                            pd.Series(cluster_labels, name="Cluster"),
+                            pd.Series(eras, name="Actual era"),
+                        )
+                        st.dataframe(crosstab, use_container_width=True)
+                        st.caption(
+                            "💡 Read this like a confusion matrix. If a cluster's row is concentrated "
+                            "in one era column, K-Means found a grouping that lines up with real "
+                            "history using **only word similarity, no labels**. If it's spread across "
+                            "columns, clustering found some *other* structure (e.g. topic or length) "
+                            "that doesn't match era — an honest, possible outcome, not a failure to hide."
+                        )
+                    else:
+                        result_df = pd.DataFrame({
+                            "Document": [
+                                l if len(l) <= 60 else l[:60] + "…" for l in labels_disp
+                            ],
+                            "Cluster": cluster_labels,
+                        })
+                        st.dataframe(result_df, use_container_width=True, hide_index=True)
+                        st.caption(
+                            "💡 No ground-truth labels here, so there's nothing to check clusters "
+                            "against — this just shows which of your documents K-Means grouped "
+                            "together based on word similarity alone."
+                        )
 
-            code_and_output(code, show_clustering_cc, key="cc_clustering")
+                code_and_output(code, show_clustering_cc, key="cc_clustering")
 
         lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
 
@@ -4038,18 +4137,76 @@ plt.show()'''
                 "<span class='badge badge-amber'>🧪 Machine Learning</span>",
                 unsafe_allow_html=True,
             )
-            st.warning(
-                "⚠️ **Honesty check:** this trains on just **10 hand-labeled reviews** — "
-                "enough to show *how* a classifier learns, nowhere near enough to be a "
-                "reliable real classifier. Production systems train on thousands to "
-                "millions of labeled examples. Treat every prediction below as a "
-                "demonstration, not a verdict. For a version trained on a real 60-document "
-                "corpus with a genuine train/test split and honest accuracy, see "
-                "**🎓 Guided Learning → 🧪 Classification & Clustering**."
+
+            clf_source = st.radio(
+                "Training data",
+                [
+                    "🎬 10 sample movie reviews (built-in)",
+                    "📁 Upload your own labeled CSV",
+                ],
+                key="clf_source_choice",
+                horizontal=True,
             )
 
-            with st.expander("📋 The training data (10 reviews, hand-labeled)"):
-                st.dataframe(SAMPLE_REVIEWS, use_container_width=True, hide_index=True)
+            if clf_source.startswith("🎬"):
+                train_texts = SAMPLE_REVIEWS["review"].tolist()
+                train_labels = SAMPLE_REVIEWS["sentiment"].tolist()
+                st.warning(
+                    "⚠️ **Honesty check:** this trains on just **10 hand-labeled reviews** — "
+                    "enough to show *how* a classifier learns, nowhere near enough to be a "
+                    "reliable real classifier. Production systems train on thousands to "
+                    "millions of labeled examples. Treat every prediction below as a "
+                    "demonstration, not a verdict. For a version trained on a real 60-document "
+                    "corpus with a genuine train/test split and honest accuracy, see "
+                    "**🎓 Guided Learning → 🧪 Classification & Clustering**."
+                )
+                with st.expander("📋 The training data (10 reviews, hand-labeled)"):
+                    st.dataframe(SAMPLE_REVIEWS, use_container_width=True, hide_index=True)
+            else:
+                st.caption(
+                    "Upload a CSV with **one text column and one label column** — classification "
+                    "needs real labels to learn from, so a plain PDF/text upload can't work here "
+                    "(there'd be nothing to learn against). This is different from Clustering, "
+                    "which needs no labels at all."
+                )
+                clf_csv = st.file_uploader(
+                    "CSV file", type=["csv"], key="clf_csv_upload",
+                    help="Nothing is stored — processed in memory only.",
+                )
+                train_texts, train_labels = [], []
+                if clf_csv is not None:
+                    try:
+                        df_clf = pd.read_csv(clf_csv)
+                        if df_clf.empty:
+                            st.warning("That CSV appears to be empty.")
+                        else:
+                            all_cols = df_clf.columns.tolist()
+                            c1, c2 = st.columns(2)
+                            text_col = c1.selectbox("Text column", all_cols, key="clf_csv_text_col")
+                            label_col = c2.selectbox(
+                                "Label column", all_cols,
+                                index=min(1, len(all_cols) - 1), key="clf_csv_label_col",
+                            )
+                            clean = df_clf[[text_col, label_col]].dropna()
+                            train_texts = clean[text_col].astype(str).tolist()
+                            train_labels = clean[label_col].astype(str).tolist()
+                            n_classes = len(set(train_labels))
+                            if len(train_texts) < 4 or n_classes < 2:
+                                st.warning(
+                                    f"Found {len(train_texts)} labeled row(s) across {n_classes} "
+                                    "class(es) — need at least a few rows across 2+ classes to "
+                                    "train anything meaningful."
+                                )
+                                train_texts, train_labels = [], []
+                            else:
+                                st.success(
+                                    f"Loaded **{len(train_texts)} labeled rows**, "
+                                    f"**{n_classes} classes**: "
+                                    + ", ".join(f"{k} ({v})" for k, v in
+                                                pd.Series(train_labels).value_counts().items())
+                                )
+                    except Exception as e:
+                        st.error(f"Couldn't read that CSV: {e}")
 
             classify_input = st.text_input(
                 "Type a sentence to classify:",
@@ -4057,26 +4214,29 @@ plt.show()'''
                 key="clf_input",
             )
 
-            st.markdown(
-                "<span class='badge badge-nltk'>📚 NLTK path — Naive Bayes</span>",
-                unsafe_allow_html=True,
-            )
-            if classify_input.strip():
-                from nltk.classify import NaiveBayesClassifier
+            if not train_texts:
+                st.info("👆 Load training data above to enable classification.")
+            else:
+                st.markdown(
+                    "<span class='badge badge-nltk'>📚 NLTK path — Naive Bayes</span>",
+                    unsafe_allow_html=True,
+                )
+                if classify_input.strip():
+                    from nltk.classify import NaiveBayesClassifier
 
-                def review_features(words):
-                    return {f"contains({w})": True for w in set(words)}
+                    def review_features(words):
+                        return {f"contains({w})": True for w in set(words)}
 
-                train_set_nltk = [
-                    (review_features(word_tokenize(review.lower())), label)
-                    for review, label in zip(SAMPLE_REVIEWS["review"], SAMPLE_REVIEWS["sentiment"])
-                ]
-                clf_nltk = NaiveBayesClassifier.train(train_set_nltk)
-                feats_input = review_features(word_tokenize(classify_input.lower()))
-                pred_nltk = clf_nltk.classify(feats_input)
-                probs_nltk = clf_nltk.prob_classify(feats_input)
+                    train_set_nltk = [
+                        (review_features(word_tokenize(str(review).lower())), label)
+                        for review, label in zip(train_texts, train_labels)
+                    ]
+                    clf_nltk = NaiveBayesClassifier.train(train_set_nltk)
+                    feats_input = review_features(word_tokenize(classify_input.lower()))
+                    pred_nltk = clf_nltk.classify(feats_input)
+                    probs_nltk = clf_nltk.prob_classify(feats_input)
 
-                code = '''# Setup: nltk.download("punkt"); nltk.download("punkt_tab")
+                    code = '''# Setup: nltk.download("punkt"); nltk.download("punkt_tab")
 from nltk.classify import NaiveBayesClassifier
 from nltk.tokenize import word_tokenize
 
@@ -4090,39 +4250,39 @@ classifier = NaiveBayesClassifier.train(train_set)
 new_text = "This movie was absolutely wonderful, I loved it!"
 print(classifier.classify(review_features(word_tokenize(new_text.lower()))))'''
 
-                def show_clf_nltk():
-                    st.metric("Predicted sentiment", pred_nltk)
-                    prob_df = pd.DataFrame(
-                        [(label, probs_nltk.prob(label)) for label in clf_nltk.labels()],
-                        columns=["Label", "Probability"],
-                    ).sort_values("Probability", ascending=False)
-                    st.bar_chart(prob_df.set_index("Label"))
-                    st.caption(
-                        "💡 NLTK's Naive Bayes uses **word presence** (is this word in the "
-                        "text, yes/no) rather than frequency or TF-IDF weighting."
-                    )
+                    def show_clf_nltk():
+                        st.metric("Predicted sentiment", pred_nltk)
+                        prob_df = pd.DataFrame(
+                            [(label, probs_nltk.prob(label)) for label in clf_nltk.labels()],
+                            columns=["Label", "Probability"],
+                        ).sort_values("Probability", ascending=False)
+                        st.bar_chart(prob_df.set_index("Label"))
+                        st.caption(
+                            "💡 NLTK's Naive Bayes uses **word presence** (is this word in the "
+                            "text, yes/no) rather than frequency or TF-IDF weighting."
+                        )
 
-                code_and_output(code, show_clf_nltk, key="tool_clf_nltk")
+                    code_and_output(code, show_clf_nltk, key="tool_clf_nltk")
 
-            st.markdown(
-                "<div class='lib-section'></div>"
-                "<span class='badge badge-spacy'>🔬 scikit-learn path — TF-IDF + Naive Bayes</span>",
-                unsafe_allow_html=True,
-            )
-            if classify_input.strip():
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                from sklearn.naive_bayes import MultinomialNB
+                st.markdown(
+                    "<div class='lib-section'></div>"
+                    "<span class='badge badge-spacy'>🔬 scikit-learn path — TF-IDF + Naive Bayes</span>",
+                    unsafe_allow_html=True,
+                )
+                if classify_input.strip():
+                    from sklearn.feature_extraction.text import TfidfVectorizer
+                    from sklearn.naive_bayes import MultinomialNB
 
-                vec_clf = TfidfVectorizer()
-                X_train = vec_clf.fit_transform(SAMPLE_REVIEWS["review"])
-                y_train = SAMPLE_REVIEWS["sentiment"]
-                clf_sk = MultinomialNB()
-                clf_sk.fit(X_train, y_train)
-                X_input = vec_clf.transform([classify_input])
-                pred_sk = clf_sk.predict(X_input)[0]
-                proba_sk = clf_sk.predict_proba(X_input)[0]
+                    vec_clf = TfidfVectorizer()
+                    X_train = vec_clf.fit_transform(train_texts)
+                    y_train = train_labels
+                    clf_sk = MultinomialNB()
+                    clf_sk.fit(X_train, y_train)
+                    X_input = vec_clf.transform([classify_input])
+                    pred_sk = clf_sk.predict(X_input)[0]
+                    proba_sk = clf_sk.predict_proba(X_input)[0]
 
-                code = '''# Setup: pip install scikit-learn
+                    code = '''# Setup: pip install scikit-learn
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 
@@ -4136,19 +4296,19 @@ X_new = vec.transform([new_text])
 print(clf.predict(X_new)[0])
 print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
 
-                def show_clf_sklearn():
-                    st.metric("Predicted sentiment", pred_sk)
-                    prob_df = pd.DataFrame(
-                        {"Label": clf_sk.classes_, "Probability": proba_sk}
-                    ).sort_values("Probability", ascending=False)
-                    st.bar_chart(prob_df.set_index("Label"))
-                    st.caption(
-                        "💡 This path weights words by **TF-IDF** rather than plain presence — "
-                        "the more standard real-world approach, and the same TfidfVectorizer "
-                        "used in the Preprocessing Pipeline's bonus TF-IDF stage."
-                    )
+                    def show_clf_sklearn():
+                        st.metric("Predicted sentiment", pred_sk)
+                        prob_df = pd.DataFrame(
+                            {"Label": clf_sk.classes_, "Probability": proba_sk}
+                        ).sort_values("Probability", ascending=False)
+                        st.bar_chart(prob_df.set_index("Label"))
+                        st.caption(
+                            "💡 This path weights words by **TF-IDF** rather than plain presence — "
+                            "the more standard real-world approach, and the same TfidfVectorizer "
+                            "used in the Preprocessing Pipeline's bonus TF-IDF stage."
+                        )
 
-                code_and_output(code, show_clf_sklearn, key="tool_clf_sklearn")
+                    code_and_output(code, show_clf_sklearn, key="tool_clf_sklearn")
 
         # ===================== CLUSTERING =====================
         elif tool == "🔬 Clustering":
@@ -4158,26 +4318,47 @@ print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
             )
             st.markdown(
                 "Clustering groups similar texts **without labels** — the opposite setup from "
-                "Classification. Here we cluster the 10 sample reviews by TF-IDF similarity "
-                "using K-Means, then flatten the high-dimensional vectors to 2D with PCA so "
-                "they can actually be plotted. For the same technique on a real 60-document "
-                "corpus — with a check against real historical eras — see "
-                "**🎓 Guided Learning → 🧪 Classification & Clustering**."
+                "Classification. Pick a data source below, then K-Means groups it by TF-IDF "
+                "similarity and PCA flattens the vectors to 2D so the groups can be plotted."
             )
 
-            k = st.slider("Number of clusters (k)", min_value=2, max_value=4, value=2, key="clust_k")
+            clust_source = st.radio(
+                "Data source",
+                [
+                    "🎬 10 sample movie reviews (built-in)",
+                    "📁 Your own documents (built-in corpus or upload)",
+                ],
+                key="clust_source_choice",
+                horizontal=True,
+            )
 
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.cluster import KMeans
-            from sklearn.decomposition import PCA
+            if clust_source.startswith("🎬"):
+                docs = SAMPLE_REVIEWS["review"].tolist()
+                doc_labels = [f"Review {i}" for i in range(len(docs))]
+            else:
+                picked = render_multi_doc_picker(key_prefix="clust_tool")
+                docs = [d["text"] for d in picked]
+                doc_labels = [d["label"] for d in picked]
 
-            docs = SAMPLE_REVIEWS["review"].tolist()
-            vec_cl = TfidfVectorizer(stop_words="english")
-            X_cl = vec_cl.fit_transform(docs)
-            km = KMeans(n_clusters=k, n_init=10, random_state=0)
-            cluster_labels = km.fit_predict(X_cl)
+            if len(docs) < 2:
+                st.info("Need at least 2 documents to cluster. Pick a source above with 2+ documents.")
+            else:
+                max_k = min(6, len(docs))
+                k = st.slider(
+                    "Number of clusters (k)", min_value=2, max_value=max(2, max_k),
+                    value=min(2, max_k), key="clust_k",
+                )
 
-            code = f'''# Setup: pip install scikit-learn
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.cluster import KMeans
+                from sklearn.decomposition import PCA
+
+                vec_cl = TfidfVectorizer(stop_words="english")
+                X_cl = vec_cl.fit_transform(docs)
+                km = KMeans(n_clusters=k, n_init=10, random_state=0)
+                cluster_labels = km.fit_predict(X_cl)
+
+                code = f'''# Setup: pip install scikit-learn
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
@@ -4190,38 +4371,40 @@ labels = km.fit_predict(X)                # which cluster each document landed i
 # Flatten to 2D purely for plotting — clustering itself uses the full vectors
 coords = PCA(n_components=2).fit_transform(X.toarray())'''
 
-            def show_clustering():
-                coords = PCA(n_components=2, random_state=0).fit_transform(X_cl.toarray())
-                fig, ax = plt.subplots(figsize=(7, 5))
-                scatter = ax.scatter(
-                    coords[:, 0], coords[:, 1], c=cluster_labels, cmap="tab10", s=120,
-                    edgecolors="black",
-                )
-                for i, (x, y) in enumerate(coords):
-                    ax.annotate(str(i), (x, y), textcoords="offset points", xytext=(6, 6))
-                ax.set_xlabel("PCA component 1")
-                ax.set_ylabel("PCA component 2")
-                ax.set_title(f"K-Means clusters (k={k}), reduced to 2D via PCA")
-                st.pyplot(fig)
-                plt.close(fig)
+                def show_clustering():
+                    coords = PCA(n_components=2, random_state=0).fit_transform(X_cl.toarray())
+                    fig, ax = plt.subplots(figsize=(7, 5))
+                    scatter = ax.scatter(
+                        coords[:, 0], coords[:, 1], c=cluster_labels, cmap="tab10", s=120,
+                        edgecolors="black",
+                    )
+                    for i, (x, y) in enumerate(coords):
+                        ax.annotate(str(i), (x, y), textcoords="offset points", xytext=(6, 6))
+                    ax.set_xlabel("PCA component 1")
+                    ax.set_ylabel("PCA component 2")
+                    ax.set_title(f"K-Means clusters (k={k}), reduced to 2D via PCA")
+                    st.pyplot(fig)
+                    plt.close(fig)
 
-                result_df = pd.DataFrame({
-                    "#": range(len(docs)),
-                    "Review": [d[:60] + ("…" if len(d) > 60 else "") for d in docs],
-                    "Cluster": cluster_labels,
-                })
-                st.dataframe(result_df, use_container_width=True, hide_index=True)
+                    result_df = pd.DataFrame({
+                        "#": range(len(docs)),
+                        "Document": [
+                            l if len(l) <= 60 else l[:60] + "…" for l in doc_labels
+                        ],
+                        "Cluster": cluster_labels,
+                    })
+                    st.dataframe(result_df, use_container_width=True, hide_index=True)
 
-                # Top terms per cluster centroid — what the cluster is actually "about"
-                terms = vec_cl.get_feature_names_out()
-                st.markdown("**What each cluster is about (top TF-IDF terms per centroid):**")
-                for c in range(k):
-                    centroid = km.cluster_centers_[c]
-                    top_terms_idx = centroid.argsort()[::-1][:6]
-                    top_terms = ", ".join(terms[i] for i in top_terms_idx if centroid[i] > 0)
-                    st.caption(f"**Cluster {c}:** {top_terms or '(no distinctive terms)'}")
+                    # Top terms per cluster centroid — what the cluster is actually "about"
+                    terms = vec_cl.get_feature_names_out()
+                    st.markdown("**What each cluster is about (top TF-IDF terms per centroid):**")
+                    for c in range(k):
+                        centroid = km.cluster_centers_[c]
+                        top_terms_idx = centroid.argsort()[::-1][:6]
+                        top_terms = ", ".join(terms[i] for i in top_terms_idx if centroid[i] > 0)
+                        st.caption(f"**Cluster {c}:** {top_terms or '(no distinctive terms)'}")
 
-            code_and_output(code, show_clustering, key="tool_clustering")
+                code_and_output(code, show_clustering, key="tool_clustering")
 
             st.info(
                 "💡 **Why PCA?** TF-IDF vectors have one dimension per vocabulary word — "
