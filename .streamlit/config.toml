@@ -1,0 +1,39 @@
+# Theme configuration for NLPPlayground.
+#
+# This uses Streamlit's native [theme] system (config.toml) rather than
+# fighting the DOM with custom CSS overrides. Reference:
+# https://docs.streamlit.io/develop/concepts/configuration/theming
+#
+# Requires a reasonably recent Streamlit (this app pins streamlit>=1.36 in
+# requirements.txt; if any option here is silently ignored on an older
+# version, Streamlit just falls back to its default for that option — it
+# does not error, so this is safe to ship).
+
+[theme]
+base = "light"
+
+# Keep the existing purple/blue brand color as the primary accent, used for
+# button hovers, focus rings, and selected items.
+primaryColor = "#6C63FF"
+
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F6FA"
+textColor = "#1F2430"
+linkColor = "#3B82F6"
+
+# Slightly rounded corners throughout (matches the existing hero/card
+# aesthetic) without the fully-pill look of "full".
+baseRadius = "0.75rem"
+
+# Base typography. Source Sans (Streamlit's own default) is already a clean,
+# highly legible UI font — the earlier issue was never the wrong font,
+# it was no deliberate sizing/weight decisions being made at all.
+font = "sans-serif"
+headingFont = "sans-serif"
+baseFontSize = 16
+
+[theme.sidebar]
+# A touch darker than the main background so the sidebar reads as a
+# distinct navigation rail rather than blending into the page.
+backgroundColor = "#F5F6FA"
+secondaryBackgroundColor = "#FFFFFF"

@@ -97,13 +97,19 @@ CUSTOM_CSS = """
         margin: 0;
     }
 
-    /* Card style container */
+    /* Card style container.
+       NOTE: this used to be `background: #ffffff10` (white at ~6% opacity),
+       which was written assuming a dark page background. On the light theme
+       this app actually uses, that resolved to an almost invisible fill —
+       the card still reserved its full padding but visually looked like
+       plain unstyled whitespace. Fixed to a real light tint that's visible
+       against the white page background. */
     .card {
-        background: #ffffff10;
-        border: 1px solid rgba(120,120,120,0.15);
+        background: #6C63FF0d;
+        border: 1px solid rgba(108,99,255,0.18);
         border-radius: 12px;
-        padding: 1.1rem 1.3rem;
-        margin-bottom: 1rem;
+        padding: 0.85rem 1.1rem;
+        margin-bottom: 0.9rem;
     }
 
     /* Badge */
@@ -153,6 +159,54 @@ CUSTOM_CSS = """
     .main .block-container p,
     .main .block-container li {
         max-width: 78ch;
+    }
+
+    /* ---------------------------------------------------------------------
+       Vertical rhythm tightening.
+       Streamlit's default spacing between stacked elements is generous
+       enough that a long lesson page reads as mostly empty space once you
+       have a dozen elements stacked — a documented, known characteristic of
+       Streamlit's default layout (see e.g. streamlit/streamlit#6867, a
+       still-open feature request for a "compact layout" mode, and multiple
+       community threads describing the out-of-the-box spacing as wasteful).
+
+       NOTE ON SELECTOR CHOICE: `[data-testid="stMetric"]` and
+       `[data-testid="stMetricLabel"]` below are confirmed, actively-used
+       selectors (independently verified via Streamlit community CSS
+       examples). Deeper container-internals selectors like
+       "stVerticalBlockBorderWrapper" are NOT part of Streamlit's documented
+       public API and were NOT independently verifiable in this environment
+       (no browser available to inspect live rendered HTML) — so, to avoid
+       shipping CSS on an unverified guess, this section is deliberately
+       limited to selectors that are either (a) independently confirmed, or
+       (b) already proven working in THIS app's existing CSS above
+       (.block-container, headings). If you want the deeper per-element gap
+       tightened further, that needs a browser DevTools inspection first. */
+    .main .block-container h1,
+    .main .block-container h2,
+    .main .block-container h3 {
+        margin-top: 0.6rem;
+        margin-bottom: 0.4rem;
+    }
+
+    /* Trim the overall top padding of the page — the default reserves
+       noticeably more headroom above the first element than a page with a
+       hero banner (which already supplies its own visual top anchor) needs. */
+    .main .block-container {
+        padding-top: 1.6rem;
+    }
+
+    /* st.metric: denser by default (small label sitting far above a large
+       number, with generous padding on all sides). Bringing the label closer
+       to its value reads as one connected unit instead of two floating
+       pieces of text with dead space between them. */
+    div[data-testid="stMetric"] {
+        background: #6C63FF08;
+        border-radius: 10px;
+        padding: 0.6rem 0.9rem 0.5rem;
+    }
+    div[data-testid="stMetricLabel"] {
+        margin-bottom: 0.1rem;
     }
 
     /* Shown only on small screens, where Streamlit collapses the sidebar behind
