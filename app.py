@@ -679,6 +679,7 @@ PY_TRACKS = {
             "0️⃣ Tokenization", "1️⃣ Stopwords", "2️⃣ Stemming",
             "3️⃣ POS Tagging", "4️⃣ NER", "5️⃣ Sentiment (VADER)",
             "6️⃣ Keyword Extraction", "7️⃣ Word Cloud",
+            "8️⃣ Frequency Distributions",
         ],
     },
     "⚡ spaCy": {
@@ -803,6 +804,7 @@ def render_overview():
             ("🧰 Working with Text Data", "Foundations", "Files, encodings, regex — getting real text INTO Python"),
             ("📚 NLTK / ⚡ spaCy — Tokenization, Stopwords, Stemming/Lemmatization", "Preprocessing", "Cleaning and normalizing text"),
             ("📚 NLTK / ⚡ spaCy — POS Tagging, NER, Dependency Parsing", "Feature Extraction", "Pulling structured information out of text"),
+            ("📚 NLTK — Frequency Distributions", "Descriptive Statistics", "FreqDist, most_common(), hapaxes — the numeric summary of a document's vocabulary"),
             ("📚 NLTK — Sentiment (VADER)", "Classification-adjacent", "Rule-based label assignment, no training involved"),
             ("🔧 Quick Tools — Preprocessing Pipeline", "Preprocessing", "The cleaning stage above, made visible and toggleable"),
             ("🔑 Quick Tools — Keyword Extraction", "Feature Extraction", "Term Frequency (TF), informally"),
@@ -2324,6 +2326,57 @@ print([(w, ps.stem(w)) for w in words])'''
 
             code_and_output(code, show_nltk_stem, key="nltk_lesson2_stem")
 
+            st.markdown("<div class='lib-section'></div>", unsafe_allow_html=True)
+            st.markdown("#### Now on the shared text — does vocabulary actually shrink?")
+            st.info(f"Shared example sentence: *\"{SHARED_TEXT_TOKENS}\"*")
+            st.caption(
+                "The 7-word list above is a clean, curated example. Real text is messier — "
+                "here's the same PorterStemmer applied to every word in the shared text, "
+                "with the vocabulary size before and after so you can see stemming's actual "
+                "effect: does it really reduce the number of distinct word-forms?"
+            )
+
+            code_shared_stem = f'''from nltk.tokenize import word_tokenize
+from nltk.stem import PorterStemmer
+
+text = "{SHARED_TEXT_TOKENS}"
+ps = PorterStemmer()
+words = [t for t in word_tokenize(text.lower()) if t.isalpha()]
+stems = [ps.stem(w) for w in words]
+
+print("Unique words:", len(set(words)))
+print("Unique stems:", len(set(stems)))'''
+
+            def show_shared_stem():
+                ps = PorterStemmer()
+                words = [t for t in word_tokenize(SHARED_TEXT_TOKENS.lower()) if t.isalpha()]
+                stems = [ps.stem(w) for w in words]
+                rows = list(zip(words, stems))
+                st.dataframe(pd.DataFrame(rows, columns=["Word", "Stem"]), use_container_width=True, hide_index=True)
+
+                n_unique_words = len(set(words))
+                n_unique_stems = len(set(stems))
+                c1, c2 = st.columns(2)
+                c1.metric("Unique words before", n_unique_words)
+                c2.metric("Unique stems after", n_unique_stems)
+                if n_unique_stems < n_unique_words:
+                    st.caption(
+                        f"💡 Stemming collapsed {n_unique_words - n_unique_stems} word-form(s) "
+                        "together — e.g. plural/singular or verb tense variants that share a "
+                        "root now count as the same term. On short text this reduction is "
+                        "often small or zero; it becomes more visible on longer documents "
+                        "with more repeated word families."
+                    )
+                else:
+                    st.caption(
+                        "💡 No reduction here — this text happens to have few words sharing "
+                        "a common root. Try a longer or more repetitive passage (or the "
+                        "Classification & Clustering module's document boxes) to see stemming "
+                        "actually shrink the vocabulary."
+                    )
+
+            code_and_output(code_shared_stem, show_shared_stem, key="nltk_lesson2_shared_stem")
+
         # --- NLTK Lesson 3: POS Tagging ---
         if lesson_idx == 3:
             st.subheader("Part-of-Speech (POS) Tagging")
@@ -2539,6 +2592,85 @@ plt.show()'''
 
             code_and_output(code, show_nltk_wordcloud, key="nltk_lesson7_wordcloud")
 
+        # --- NLTK Lesson 8: Frequency Distributions ---
+        if lesson_idx == 8:
+            st.subheader("Frequency Distributions")
+            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown(
+                "NLTK has a purpose-built object for exactly the counting you've been doing "
+                "informally since **Keyword Extraction**: `FreqDist`. It's a specialized "
+                "dictionary of counts with convenience methods built in — `most_common()`, "
+                "plotting, and `hapaxes()` (words that appear **exactly once**, often the "
+                "most distinctive ones in a document)."
+            )
+            st.info(f"Shared example sentence: *\"{SHARED_TEXT_ENTITIES}\"*")
+
+            with st.expander("💡 Why this matters for NLP"):
+                st.markdown(
+                    "This is descriptive statistics for text — the same instinct as `.describe()` "
+                    "on a numeric DataFrame column, applied to word counts instead. Before "
+                    "reaching for TF-IDF, classification, or clustering, a `FreqDist` is "
+                    "usually the first thing worth looking at: how many distinct words are "
+                    "there, how skewed is the distribution (a handful of words dominating, "
+                    "or fairly even), and are there hapaxes worth investigating."
+                )
+
+            code = f'''# Setup (run once, e.g. in Colab):
+# import nltk
+# nltk.download("punkt"); nltk.download("punkt_tab"); nltk.download("stopwords")
+
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk import FreqDist
+
+text = "{SHARED_TEXT_ENTITIES}"
+stop_words = set(stopwords.words("english"))
+tokens = word_tokenize(text.lower())
+words = [t for t in tokens if t.isalpha() and t not in stop_words]
+
+fd = FreqDist(words)
+print("Distinct words:", fd.B())          # B() = number of distinct word "bins"
+print("Total word count:", fd.N())        # N() = total token count
+print("Most common:", fd.most_common(10))
+print("Hapaxes (appear once):", fd.hapaxes())'''
+
+            def show_freqdist():
+                stop_words = set(stopwords.words("english"))
+                tokens = word_tokenize(SHARED_TEXT_ENTITIES.lower())
+                words = [t for t in tokens if t.isalpha() and t not in stop_words]
+                if not words:
+                    st.warning("No words left after removing stopwords — try a longer or different shared text.")
+                    return
+
+                from nltk import FreqDist
+                fd = FreqDist(words)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Distinct words", fd.B())
+                c2.metric("Total word count", fd.N())
+                c3.metric("Hapaxes (appear once)", len(fd.hapaxes()))
+
+                top = fd.most_common(10)
+                top_df = pd.DataFrame(top, columns=["Word", "Count"])
+                st.dataframe(top_df, use_container_width=True, hide_index=True)
+                st.bar_chart(top_df.set_index("Word"))
+
+                hapaxes = fd.hapaxes()
+                if hapaxes:
+                    shown = ", ".join(f"`{w}`" for w in hapaxes[:15])
+                    more = f" (+{len(hapaxes) - 15} more)" if len(hapaxes) > 15 else ""
+                    st.caption(
+                        f"💡 **{len(hapaxes)} hapax(es)** — words appearing exactly once: "
+                        f"{shown}{more}. On short text almost every word is a hapax (nothing "
+                        "repeats yet); on longer documents, a high hapax count relative to "
+                        "total words is itself a descriptive statistic — it tells you the "
+                        "vocabulary is diverse rather than repetitive."
+                    )
+                else:
+                    st.caption("💡 No hapaxes — every word here repeats at least once.")
+
+            code_and_output(code, show_freqdist, key="nltk_lesson8_freqdist")
+
             if st.button("✓ NLTK track complete", key="nltk_done"):
                 st.success("Nice work! Try the ⚡ spaCy track next to see the same tasks with a model-based library →")
 
@@ -2679,6 +2811,56 @@ print([(t.text, t.lemma_) for t in doc])'''
                     st.dataframe(pd.DataFrame(rows, columns=["Word", "Lemma"]), use_container_width=True, hide_index=True)
 
                 code_and_output(code, show_spacy_lemma, key="spacy_lesson2_lemma")
+
+                st.markdown("<div class='lib-section'></div>", unsafe_allow_html=True)
+                st.markdown("#### Now on the shared text — does vocabulary actually shrink?")
+                st.info(f"Shared example sentence: *\"{SHARED_TEXT_TOKENS}\"*")
+                st.caption(
+                    "The 7-word list above is a clean, curated example. Real text is "
+                    "messier — here's spaCy's lemmatizer applied to every word in the "
+                    "shared text, with the vocabulary size before and after, for a direct "
+                    "comparison with the **📚 NLTK → Stemming** lesson's same measurement."
+                )
+
+                code_shared_lemma = f'''import spacy
+nlp = spacy.load("en_core_web_sm")
+
+text = "{SHARED_TEXT_TOKENS}"
+doc = nlp(text)
+words = [t.text.lower() for t in doc if t.is_alpha]
+lemmas = [t.lemma_.lower() for t in doc if t.is_alpha]
+
+print("Unique words:", len(set(words)))
+print("Unique lemmas:", len(set(lemmas)))'''
+
+                def show_shared_lemma():
+                    doc = nlp_spacy(SHARED_TEXT_TOKENS)
+                    words = [t.text.lower() for t in doc if t.is_alpha]
+                    lemmas = [t.lemma_.lower() for t in doc if t.is_alpha]
+                    rows = [(t.text, t.lemma_) for t in doc if t.is_alpha]
+                    st.dataframe(pd.DataFrame(rows, columns=["Word", "Lemma"]), use_container_width=True, hide_index=True)
+
+                    n_unique_words = len(set(words))
+                    n_unique_lemmas = len(set(lemmas))
+                    c1, c2 = st.columns(2)
+                    c1.metric("Unique words before", n_unique_words)
+                    c2.metric("Unique lemmas after", n_unique_lemmas)
+                    if n_unique_lemmas < n_unique_words:
+                        st.caption(
+                            f"💡 Lemmatization collapsed {n_unique_words - n_unique_lemmas} "
+                            "word-form(s) together, and — unlike stemming — every collapsed "
+                            "form is still a real dictionary word. Compare this reduction "
+                            "count to the NLTK Stemming lesson's on the same text: they "
+                            "often differ, since the two use completely different rules."
+                        )
+                    else:
+                        st.caption(
+                            "💡 No reduction here — try a longer or more repetitive passage "
+                            "to see lemmatization actually shrink the vocabulary."
+                        )
+
+                code_and_output(code_shared_lemma, show_shared_lemma, key="spacy_lesson2_shared_lemma")
+
                 st.markdown(
                     "<div class='lib-section'></div>"
                     "🔍 **NLTK vs spaCy here:** every lemma above is a real word — the "
