@@ -22,6 +22,9 @@ Last audited: 2 August 2026.
 | spaCy (source code) | MIT | ✅ Yes | |
 | `en_core_web_sm` (model) | MIT | ✅ Yes | See §3 — cleaner than it first appears |
 | pypdf | BSD 3-Clause | ✅ Yes | Pure-Python, installs with no transitive dependencies |
+| wordcloud | MIT | ✅ Yes | Bundles `DroidSansMono.ttf` (Apache 2.0, also permissive) as its default font |
+| matplotlib | PSF-based (BSD-style) | ✅ Yes | Used only to render the word cloud image; no GUI backend (`Agg`) |
+| scikit-learn | BSD 3-Clause | ✅ Yes | Used for TF-IDF, Naive Bayes classification, and K-Means clustering |
 
 Note: NLTK's **documentation** (as distinct from its code) is licensed
 CC BY-NC-ND 3.0 US. We do not reproduce NLTK documentation text in this app.

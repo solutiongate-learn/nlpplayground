@@ -11,6 +11,10 @@ import pandas as pd
 from collections import Counter
 import re
 import string
+import matplotlib
+matplotlib.use("Agg")  # headless backend — this app never opens a GUI window
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
 
 # ---------------------------------------------------------------------------
 # NLTK setup (cached so it only downloads once per app instance)
@@ -200,7 +204,14 @@ SAMPLE_REVIEWS = pd.DataFrame({
         "I loved every minute of it. The director really outdid herself with this masterpiece.",
         "Boring from start to finish. I almost fell asleep twice.",
         "Solid film overall. Great soundtrack, good performances, worth watching once.",
-    ]
+    ],
+    # Hand-labeled by reading each review — used for the Classification Quick Tool.
+    # Kept honest rather than optimized: review 3 and 7 are genuinely mixed/neutral,
+    # not forced into positive/negative to make the demo look cleaner.
+    "sentiment": [
+        "positive", "negative", "neutral", "positive", "negative",
+        "positive", "neutral", "positive", "negative", "positive",
+    ],
 })
 
 # Public-domain corpora available through NLTK, offered as sample text.
@@ -2437,6 +2448,9 @@ for token in doc:
                 "😊 Sentiment Analysis",
                 "🔑 Keyword Extraction",
                 "🏷️ Named Entity Recognition",
+                "☁️ Word Cloud",
+                "🧪 Classification",
+                "🔬 Clustering",
             ],
         )
 
@@ -2572,6 +2586,61 @@ for token in doc:
                     "can turn a word into something the stopword list no longer matches. "
                     "Try reordering mentally and predict what changes."
                 )
+
+                # --- Optional bonus stage: TF-IDF ---
+                # Deliberately NOT wired into the token-count chain above: TF-IDF's "IDF"
+                # half is only meaningful across a CORPUS of documents. Computed on a
+                # single document it collapses to something proportional to plain term
+                # frequency — a common student confusion this tool makes explicit rather
+                # than hiding.
+                st.markdown("<div class='lib-section'></div>", unsafe_allow_html=True)
+                show_tfidf = st.checkbox(
+                    "🎯 Bonus: show TF-IDF weighting (scikit-learn)", key="pp_tfidf"
+                )
+                if show_tfidf:
+                    st.caption(
+                        "TF-IDF needs **more than one document** to mean anything — IDF "
+                        "measures how rare a word is *across documents*. Your text is scored "
+                        "here against our 10-review reference corpus, so a word gets a high "
+                        "score only if it's frequent in your text **and** uncommon in the "
+                        "reference set."
+                    )
+                    from sklearn.feature_extraction.text import TfidfVectorizer
+
+                    corpus_for_tfidf = SAMPLE_REVIEWS["review"].tolist() + [text]
+                    vec = TfidfVectorizer(stop_words="english")
+                    tfidf_matrix = vec.fit_transform(corpus_for_tfidf)
+                    feature_names = vec.get_feature_names_out()
+                    your_row = tfidf_matrix[-1].toarray().ravel()
+                    top_idx = your_row.argsort()[::-1][:10]
+                    top_terms = [(feature_names[i], round(float(your_row[i]), 3))
+                                 for i in top_idx if your_row[i] > 0]
+
+                    if top_terms:
+                        tfidf_df = pd.DataFrame(top_terms, columns=["Term", "TF-IDF weight"])
+                        st.dataframe(tfidf_df, use_container_width=True, hide_index=True)
+                        st.bar_chart(tfidf_df.set_index("Term"))
+                    else:
+                        st.info(
+                            "Every word in your text either doesn't appear in the reference "
+                            "corpus's vocabulary or was filtered as a stopword — try a longer, "
+                            "more topical piece of text."
+                        )
+
+                    tfidf_code = '''# Setup: pip install scikit-learn
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# TF-IDF needs a CORPUS — here, your text plus a small reference corpus
+corpus = reference_reviews + [your_text]
+vec = TfidfVectorizer(stop_words="english")
+matrix = vec.fit_transform(corpus)
+
+# Your text is the last row
+your_scores = matrix[-1].toarray().ravel()
+terms = vec.get_feature_names_out()
+top10 = sorted(zip(terms, your_scores), key=lambda x: -x[1])[:10]
+print(top10)'''
+                    st.code(tfidf_code, language="python")
 
         # ===================== SENTIMENT ANALYSIS =====================
         elif tool == "😊 Sentiment Analysis":
@@ -2819,6 +2888,302 @@ for ent in doc.ents:
                 st.markdown("**🎨 Entities highlighted in your text**")
                 render_entities(doc, key="viz_tool_ner")
 
+        # ===================== WORD CLOUD =====================
+        elif tool == "☁️ Word Cloud":
+            st.markdown(
+                "A word cloud sizes each word by how often it appears — a quick visual gut-check "
+                "of what a text is about. It's built on the **same word-frequency counting** as "
+                "Keyword Extraction, just rendered differently, using every word rather than the "
+                "top 10."
+            )
+
+            def render_wordcloud(freq_dict: dict, key: str):
+                if not freq_dict:
+                    st.warning("No words left to plot — try a longer text or fewer filters.")
+                    return
+                wc = WordCloud(
+                    width=800, height=400, background_color="white", colormap="viridis"
+                ).generate_from_frequencies(freq_dict)
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.imshow(wc, interpolation="bilinear")
+                ax.axis("off")
+                st.pyplot(fig)
+                plt.close(fig)  # free memory — Streamlit Cloud's ceiling is ~1GB total
+
+            st.markdown(
+                "<span class='badge badge-nltk'>📚 NLTK path</span>",
+                unsafe_allow_html=True,
+            )
+            if text.strip():
+                stop_words = set(stopwords.words("english"))
+                tokens_wc = word_tokenize(clean_text(text))
+                words_wc = [t for t in tokens_wc if t.isalpha() and t not in stop_words]
+                freq_wc_nltk = dict(Counter(words_wc))
+
+                code = '''# Setup (run once, e.g. in Colab):
+# import nltk
+# nltk.download("punkt"); nltk.download("punkt_tab"); nltk.download("stopwords")
+# !pip install wordcloud matplotlib
+
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from collections import Counter
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+
+stop_words = set(stopwords.words("english"))
+tokens = word_tokenize(text.lower())
+words = [t for t in tokens if t.isalpha() and t not in stop_words]
+freq = dict(Counter(words))
+
+wc = WordCloud(width=800, height=400, background_color="white").generate_from_frequencies(freq)
+plt.imshow(wc, interpolation="bilinear")
+plt.axis("off")
+plt.show()'''
+
+                def show_wc_nltk():
+                    render_wordcloud(freq_wc_nltk, key="wc_nltk")
+                    st.caption(f"💡 Built from **{len(freq_wc_nltk)}** unique words after stopword removal.")
+
+                code_and_output(code, show_wc_nltk, key="tool_wc_nltk")
+
+            st.markdown(
+                "<div class='lib-section'></div>"
+                "<span class='badge badge-spacy'>⚡ spaCy path</span>",
+                unsafe_allow_html=True,
+            )
+            nlp_spacy, spacy_ok = get_spacy_model()
+            if not spacy_ok:
+                st.error("spaCy couldn't load right now. Refresh and try again in a moment.")
+            elif text.strip():
+                doc_wc = nlp_spacy(text)
+                words_wc_spacy = [t.lemma_.lower() for t in doc_wc if not t.is_stop and t.is_alpha]
+                freq_wc_spacy = dict(Counter(words_wc_spacy))
+
+                code = '''# Setup (run once, e.g. in Colab):
+# !pip install spacy wordcloud matplotlib
+# !python -m spacy download en_core_web_sm
+
+import spacy
+from collections import Counter
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+
+nlp = spacy.load("en_core_web_sm")
+doc = nlp(text)
+words = [t.lemma_.lower() for t in doc if not t.is_stop and t.is_alpha]
+freq = dict(Counter(words))
+
+wc = WordCloud(width=800, height=400, background_color="white").generate_from_frequencies(freq)
+plt.imshow(wc, interpolation="bilinear")
+plt.axis("off")
+plt.show()'''
+
+                def show_wc_spacy():
+                    render_wordcloud(freq_wc_spacy, key="wc_spacy")
+                    st.caption(
+                        f"💡 Built from **{len(freq_wc_spacy)}** unique lemmas — spaCy merges "
+                        "inflections (e.g. \"runs\"/\"running\"→\"run\") before counting, so this "
+                        "cloud can look noticeably different from the NLTK one above."
+                    )
+
+                code_and_output(code, show_wc_spacy, key="tool_wc_spacy")
+
+        # ===================== CLASSIFICATION =====================
+        elif tool == "🧪 Classification":
+            st.markdown(
+                "<span class='badge badge-amber'>🧪 Machine Learning</span>",
+                unsafe_allow_html=True,
+            )
+            st.warning(
+                "⚠️ **Honesty check:** this trains on just **10 hand-labeled reviews** — "
+                "enough to show *how* a classifier learns, nowhere near enough to be a "
+                "reliable real classifier. Production systems train on thousands to "
+                "millions of labeled examples. Treat every prediction below as a "
+                "demonstration, not a verdict."
+            )
+
+            with st.expander("📋 The training data (10 reviews, hand-labeled)"):
+                st.dataframe(SAMPLE_REVIEWS, use_container_width=True, hide_index=True)
+
+            classify_input = st.text_input(
+                "Type a sentence to classify:",
+                value="This movie was absolutely wonderful, I loved it!",
+                key="clf_input",
+            )
+
+            st.markdown(
+                "<span class='badge badge-nltk'>📚 NLTK path — Naive Bayes</span>",
+                unsafe_allow_html=True,
+            )
+            if classify_input.strip():
+                from nltk.classify import NaiveBayesClassifier
+
+                def review_features(words):
+                    return {f"contains({w})": True for w in set(words)}
+
+                train_set_nltk = [
+                    (review_features(word_tokenize(review.lower())), label)
+                    for review, label in zip(SAMPLE_REVIEWS["review"], SAMPLE_REVIEWS["sentiment"])
+                ]
+                clf_nltk = NaiveBayesClassifier.train(train_set_nltk)
+                feats_input = review_features(word_tokenize(classify_input.lower()))
+                pred_nltk = clf_nltk.classify(feats_input)
+                probs_nltk = clf_nltk.prob_classify(feats_input)
+
+                code = '''# Setup: nltk.download("punkt"); nltk.download("punkt_tab")
+from nltk.classify import NaiveBayesClassifier
+from nltk.tokenize import word_tokenize
+
+def review_features(words):
+    return {f"contains({w})": True for w in set(words)}
+
+train_set = [(review_features(word_tokenize(r.lower())), label)
+             for r, label in zip(reviews, labels)]
+classifier = NaiveBayesClassifier.train(train_set)
+
+new_text = "This movie was absolutely wonderful, I loved it!"
+print(classifier.classify(review_features(word_tokenize(new_text.lower()))))'''
+
+                def show_clf_nltk():
+                    st.metric("Predicted sentiment", pred_nltk)
+                    prob_df = pd.DataFrame(
+                        [(label, probs_nltk.prob(label)) for label in clf_nltk.labels()],
+                        columns=["Label", "Probability"],
+                    ).sort_values("Probability", ascending=False)
+                    st.bar_chart(prob_df.set_index("Label"))
+                    st.caption(
+                        "💡 NLTK's Naive Bayes uses **word presence** (is this word in the "
+                        "text, yes/no) rather than frequency or TF-IDF weighting."
+                    )
+
+                code_and_output(code, show_clf_nltk, key="tool_clf_nltk")
+
+            st.markdown(
+                "<div class='lib-section'></div>"
+                "<span class='badge badge-spacy'>🔬 scikit-learn path — TF-IDF + Naive Bayes</span>",
+                unsafe_allow_html=True,
+            )
+            if classify_input.strip():
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.naive_bayes import MultinomialNB
+
+                vec_clf = TfidfVectorizer()
+                X_train = vec_clf.fit_transform(SAMPLE_REVIEWS["review"])
+                y_train = SAMPLE_REVIEWS["sentiment"]
+                clf_sk = MultinomialNB()
+                clf_sk.fit(X_train, y_train)
+                X_input = vec_clf.transform([classify_input])
+                pred_sk = clf_sk.predict(X_input)[0]
+                proba_sk = clf_sk.predict_proba(X_input)[0]
+
+                code = '''# Setup: pip install scikit-learn
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+
+vec = TfidfVectorizer()
+X_train = vec.fit_transform(reviews)
+clf = MultinomialNB()
+clf.fit(X_train, labels)
+
+new_text = "This movie was absolutely wonderful, I loved it!"
+X_new = vec.transform([new_text])
+print(clf.predict(X_new)[0])
+print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
+
+                def show_clf_sklearn():
+                    st.metric("Predicted sentiment", pred_sk)
+                    prob_df = pd.DataFrame(
+                        {"Label": clf_sk.classes_, "Probability": proba_sk}
+                    ).sort_values("Probability", ascending=False)
+                    st.bar_chart(prob_df.set_index("Label"))
+                    st.caption(
+                        "💡 This path weights words by **TF-IDF** rather than plain presence — "
+                        "the more standard real-world approach, and the same TfidfVectorizer "
+                        "used in the Preprocessing Pipeline's bonus TF-IDF stage."
+                    )
+
+                code_and_output(code, show_clf_sklearn, key="tool_clf_sklearn")
+
+        # ===================== CLUSTERING =====================
+        elif tool == "🔬 Clustering":
+            st.markdown(
+                "<span class='badge badge-amber'>🔬 Machine Learning</span>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "Clustering groups similar texts **without labels** — the opposite setup from "
+                "Classification. Here we cluster the 10 sample reviews by TF-IDF similarity "
+                "using K-Means, then flatten the high-dimensional vectors to 2D with PCA so "
+                "they can actually be plotted."
+            )
+
+            k = st.slider("Number of clusters (k)", min_value=2, max_value=4, value=2, key="clust_k")
+
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.cluster import KMeans
+            from sklearn.decomposition import PCA
+
+            docs = SAMPLE_REVIEWS["review"].tolist()
+            vec_cl = TfidfVectorizer(stop_words="english")
+            X_cl = vec_cl.fit_transform(docs)
+            km = KMeans(n_clusters=k, n_init=10, random_state=0)
+            cluster_labels = km.fit_predict(X_cl)
+
+            code = f'''# Setup: pip install scikit-learn
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+
+vec = TfidfVectorizer(stop_words="english")
+X = vec.fit_transform(documents)          # TF-IDF vectors, one row per document
+km = KMeans(n_clusters={k}, n_init=10, random_state=0)
+labels = km.fit_predict(X)                # which cluster each document landed in
+
+# Flatten to 2D purely for plotting — clustering itself uses the full vectors
+coords = PCA(n_components=2).fit_transform(X.toarray())'''
+
+            def show_clustering():
+                coords = PCA(n_components=2, random_state=0).fit_transform(X_cl.toarray())
+                fig, ax = plt.subplots(figsize=(7, 5))
+                scatter = ax.scatter(
+                    coords[:, 0], coords[:, 1], c=cluster_labels, cmap="tab10", s=120,
+                    edgecolors="black",
+                )
+                for i, (x, y) in enumerate(coords):
+                    ax.annotate(str(i), (x, y), textcoords="offset points", xytext=(6, 6))
+                ax.set_xlabel("PCA component 1")
+                ax.set_ylabel("PCA component 2")
+                ax.set_title(f"K-Means clusters (k={k}), reduced to 2D via PCA")
+                st.pyplot(fig)
+                plt.close(fig)
+
+                result_df = pd.DataFrame({
+                    "#": range(len(docs)),
+                    "Review": [d[:60] + ("…" if len(d) > 60 else "") for d in docs],
+                    "Cluster": cluster_labels,
+                })
+                st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+                # Top terms per cluster centroid — what the cluster is actually "about"
+                terms = vec_cl.get_feature_names_out()
+                st.markdown("**What each cluster is about (top TF-IDF terms per centroid):**")
+                for c in range(k):
+                    centroid = km.cluster_centers_[c]
+                    top_terms_idx = centroid.argsort()[::-1][:6]
+                    top_terms = ", ".join(terms[i] for i in top_terms_idx if centroid[i] > 0)
+                    st.caption(f"**Cluster {c}:** {top_terms or '(no distinctive terms)'}")
+
+            code_and_output(code, show_clustering, key="tool_clustering")
+
+            st.info(
+                "💡 **Why PCA?** TF-IDF vectors have one dimension per vocabulary word — "
+                "far more than 2 or 3, impossible to plot directly. PCA finds the two "
+                "directions of greatest variance and projects onto those, losing information "
+                "but making the clusters visually inspectable. K-Means itself runs on the "
+                "full, un-reduced vectors."
+            )
+
     # -----------------------------------------------------------------------
     # ABOUT
     # -----------------------------------------------------------------------
@@ -2830,9 +3195,10 @@ for ent in doc.ents:
             Language Processing by *seeing real code and real (or worked-example) output side
             by side* — built for students, business professionals, and practitioners alike.
 
-            **This is an early Phase 1 preview.** More lessons, datasets, and tools (topic modeling,
-            clustering, classification, AI-powered explanations, and side-by-side text comparison)
-            are on the way.
+            **This is an early Phase 1 preview.** Word clouds, Naive Bayes classification, and
+            K-Means clustering (with TF-IDF) have joined Quick Tools. More lessons, datasets,
+            and tools (topic modeling, AI-powered explanations, and side-by-side text
+            comparison) are on the way.
 
             ---
             **A note on privacy:** this demo processes text in-memory only and does not store or
@@ -3440,9 +3806,10 @@ print(entities)'''
             Language Processing by *seeing real code and real (or worked-example) output side
             by side* — built for students, business professionals, and practitioners alike.
 
-            **This is an early Phase 1 preview.** More lessons, datasets, and tools (topic modeling,
-            clustering, classification, AI-powered explanations, and side-by-side text comparison)
-            are on the way.
+            **This is an early Phase 1 preview.** Word clouds, Naive Bayes classification, and
+            K-Means clustering (with TF-IDF) have joined Quick Tools. More lessons, datasets,
+            and tools (topic modeling, AI-powered explanations, and side-by-side text
+            comparison) are on the way.
 
             ---
             **A note on privacy:** this demo processes text in-memory only and does not store or
