@@ -244,6 +244,132 @@ def load_public_domain_text(corpus_name: str, file_id: str, max_chars: int = 200
         from nltk.corpus import udhr as _c
     return _c.raw(file_id)[:max_chars]
 
+
+# ---------------------------------------------------------------------------
+# MULTI-DOCUMENT CORPORA — for Classification and Clustering, which need many
+# documents to be meaningful (unlike the single-text tools above).
+#
+# We deliberately do NOT use NLTK's movie_reviews or brown corpora here even
+# though they're the standard teaching datasets for this exact purpose —
+# checked their actual licenses: movie_reviews is "distributed with permission
+# from the authors" (Pang & Lee) and brown is explicitly non-commercial-only.
+# Both are fine for NLTK's own redistribution but carry the same restricted
+# category already flagged for maxent_ne_chunker in CONTENT-LICENSES.md — this
+# app's standing rule is public-domain-with-no-limitations, so we use genuinely
+# public-domain multi-document sources instead: US inaugural addresses (US
+# government works) and Gutenberg books.
+#
+# Bonus: inaugural addresses carry REAL, non-fabricated metadata for
+# classification — the year and president are literally in the filename
+# (e.g. "1861-Lincoln.txt") — so "predict the era from the speech" is a
+# genuine supervised task with zero invented labels.
+# ---------------------------------------------------------------------------
+MULTI_DOC_MAX_CHARS = 6000   # per document — long enough to be real text, short enough to stay fast
+MULTI_DOC_MAX_UPLOAD_FILES = 8
+MULTI_DOC_MAX_UPLOAD_CHARS = 20000  # per uploaded file
+
+
+def _era_from_year(year: int) -> str:
+    """Mechanical bucketing from a real year — not an invented/subjective label."""
+    if year < 1900:
+        return "19th century (pre-1900)"
+    elif year < 2000:
+        return "20th century (1900-1999)"
+    else:
+        return "21st century (2000+)"
+
+
+@st.cache_resource(show_spinner="Loading all 60 US inaugural addresses (first use only)...")
+def load_inaugural_corpus(max_chars: int = MULTI_DOC_MAX_CHARS):
+    """Every US inaugural address, 1789-2025. Returns list of dicts with the
+    year/president pulled straight from NLTK's own filenames — genuine
+    metadata, not something we assigned by reading the text."""
+    nltk.download("inaugural", quiet=True)
+    from nltk.corpus import inaugural
+    docs = []
+    for fid in inaugural.fileids():
+        year = int(fid[:4])
+        president = fid[5:-4]
+        docs.append({
+            "label": f"{year} {president}",
+            "year": year,
+            "era": _era_from_year(year),
+            "text": inaugural.raw(fid)[:max_chars],
+        })
+    return docs
+
+
+@st.cache_resource(show_spinner="Loading 18 public-domain books (first use only)...")
+def load_gutenberg_corpus(max_chars: int = MULTI_DOC_MAX_CHARS):
+    """Opening portion of each of NLTK's 18 bundled Gutenberg texts. Capped per
+    book — this is a stylistic-similarity demo (whose writing does this
+    resemble?), not full-book analysis, and we say so in the UI."""
+    nltk.download("gutenberg", quiet=True)
+    from nltk.corpus import gutenberg
+    docs = []
+    for fid in gutenberg.fileids():
+        docs.append({
+            "label": fid.replace(".txt", ""),
+            "author": fid.split("-")[0],
+            "text": gutenberg.raw(fid)[:max_chars],
+        })
+    return docs
+
+
+def render_multi_doc_picker(key_prefix: str):
+    """Shared UI for picking a multi-document corpus: built-in public-domain
+    sets, or the user's own uploaded files. Returns a list of dicts each with
+    at least 'label' and 'text' keys, or an empty list if nothing is ready yet.
+
+    Used by both the Classification & Clustering guided lessons and the
+    upgraded Quick Tools versions, so the two stay consistent.
+    """
+    source = st.radio(
+        "Multi-document corpus",
+        [
+            "🏛️ US Inaugural Addresses (60 speeches, 1789–2025, public domain)",
+            "📚 Gutenberg books (18 novels/texts, opening portion, public domain)",
+            "📁 Upload your own files",
+        ],
+        key=f"{key_prefix}_source",
+    )
+
+    if source.startswith("🏛️"):
+        return load_inaugural_corpus()
+
+    if source.startswith("📚"):
+        return load_gutenberg_corpus()
+
+    # --- Upload path ---
+    uploaded = st.file_uploader(
+        f"Upload up to {MULTI_DOC_MAX_UPLOAD_FILES} files (.txt or .pdf)",
+        type=["txt", "pdf"],
+        accept_multiple_files=True,
+        key=f"{key_prefix}_upload",
+    )
+    if not uploaded:
+        st.info("Upload at least 2 files to enable classification/clustering on your own text.")
+        return []
+    if len(uploaded) > MULTI_DOC_MAX_UPLOAD_FILES:
+        st.warning(
+            f"Only the first {MULTI_DOC_MAX_UPLOAD_FILES} files will be used "
+            f"(you uploaded {len(uploaded)}) — this keeps the demo fast on a "
+            "shared, memory-limited server."
+        )
+    docs = []
+    for f in uploaded[:MULTI_DOC_MAX_UPLOAD_FILES]:
+        try:
+            if f.name.lower().endswith(".pdf"):
+                from pypdf import PdfReader
+                reader = PdfReader(f)
+                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            else:
+                text = f.read().decode("utf-8", errors="replace")
+            docs.append({"label": f.name, "text": text[:MULTI_DOC_MAX_UPLOAD_CHARS]})
+        except Exception as e:
+            st.error(f"Couldn't read {f.name}: {e}")
+    return docs
+
 # Shared example sentences used across BOTH the NLTK and spaCy guided tracks,
 # so lessons that cover the same task (tokenization, stopwords, POS, NER) run
 # on identical input — differences you see are real library differences, not
@@ -324,6 +450,14 @@ PY_TRACKS = {
             "3️⃣ POS Tagging", "4️⃣ NER", "5️⃣ Dependency Parsing",
         ],
     },
+    "🧪 Classification & Clustering": {
+        "blurb": "From counting words to machine learning: TF → TF-IDF → predicting labels → finding groups.",
+        "level": "Machine Learning",
+        "lessons": [
+            "0️⃣ Term Frequency (TF)", "1️⃣ TF-IDF (needs a corpus)",
+            "2️⃣ Naive Bayes Classification", "3️⃣ K-Means Clustering",
+        ],
+    },
 }
 
 R_LESSONS = [
@@ -363,6 +497,8 @@ def render_overview():
          "Ready for NLP. The classic, rule-based toolkit."),
         ("⚡", "spaCy", "NLP", PY_TRACKS["⚡ spaCy"],
          "The same tasks in a modern, model-based library — built for comparison."),
+        ("🧪", "Classification & Clustering", "Machine Learning", PY_TRACKS["🧪 Classification & Clustering"],
+         "TF → TF-IDF → predicting labels → finding groups, on 60 real inaugural addresses."),
     ]
     for icon, name, level, meta, who in steps:
         track_key = f"{icon} {name}"
@@ -415,6 +551,27 @@ def render_overview():
         "a function, start at **🧰 Working with Text Data**. If you just want to see NLP "
         "do something, go straight to **⚡ Quick Tools**."
     )
+
+    with st.expander("🗺️ Where everything fits in the NLP pipeline"):
+        st.caption(
+            "A real NLP/ML workflow has a shape: clean the text, turn it into numbers, "
+            "then either predict a label or find groups. Every lesson and tool below maps "
+            "onto one stage of that shape."
+        )
+        taxonomy = pd.DataFrame([
+            ("🧱 Fundamentals", "Foundations", "Python itself — no NLP yet"),
+            ("🧰 Working with Text Data", "Foundations", "Files, encodings, regex — getting real text INTO Python"),
+            ("📚 NLTK / ⚡ spaCy — Tokenization, Stopwords, Stemming/Lemmatization", "Preprocessing", "Cleaning and normalizing text"),
+            ("📚 NLTK / ⚡ spaCy — POS Tagging, NER, Dependency Parsing", "Feature Extraction", "Pulling structured information out of text"),
+            ("📚 NLTK — Sentiment (VADER)", "Classification-adjacent", "Rule-based label assignment, no training involved"),
+            ("🔧 Quick Tools — Preprocessing Pipeline", "Preprocessing", "The cleaning stage above, made visible and toggleable"),
+            ("🔑 Quick Tools — Keyword Extraction", "Feature Extraction", "Term Frequency (TF), informally"),
+            ("☁️ Quick Tools — Word Cloud", "Visualization", "A picture of Feature Extraction's output"),
+            ("🧪 Classification & Clustering — TF, TF-IDF", "Feature Extraction", "Turning text into numbers properly, with a real multi-document corpus"),
+            ("🧪 Classification & Clustering — Naive Bayes", "Classification", "Predicting a label (era) from learned examples"),
+            ("🧪 Classification & Clustering — K-Means", "Clustering", "Finding groups with no labels at all"),
+        ], columns=["Where", "Category", "What it actually does"])
+        st.dataframe(taxonomy, use_container_width=True, hide_index=True)
 
 
 def lesson_footer(track_key: str, idx: int, lessons: list, state_key: str):
@@ -2309,12 +2466,271 @@ for token in doc:
                 if st.button("✓ spaCy track complete", key="spacy_done"):
                     st.success("Great work — you've now seen the same NLP tasks through both a classic (NLTK) and modern (spaCy) lens.")
 
+            lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
+
+    # -----------------------------------------------------------------------
+    # CLASSIFICATION & CLUSTERING — added after users pointed out these
+    # concepts existed only as Quick Tools with no lesson explaining them, and
+    # that the Quick Tools' 10 short sample reviews were too small/thin for
+    # real insight. This module uses NLTK's inaugural-address corpus (60 real
+    # speeches, 1789-2025, genuinely public domain — US government works) so
+    # TF-IDF, classification, and clustering all have a real multi-document
+    # corpus to work with, and a REAL classification target: the era, computed
+    # mechanically from the year in each filename, not an invented label.
+    # -----------------------------------------------------------------------
+    elif mode == "🎓 Guided Learning" and track == "🧪 Classification & Clustering":
+        st.markdown(
+            "<div class='module-head'><span class='badge badge-amber'>Module 5 · Machine Learning</span>"
+            "<h2>Classification &amp; Clustering</h2>"
+            "<p>From counting words to predicting labels and finding groups — TF, TF-IDF, "
+            "Naive Bayes, and K-Means, each demonstrated on a real 60-document corpus "
+            "instead of a toy sentence.</p></div>",
+            unsafe_allow_html=True,
+        )
+
+        # --- Lesson 0: Term Frequency (TF) ---
+        if lesson_idx == 0:
+            st.subheader("Term Frequency (TF)")
+            st.markdown(
+                "<span class='badge badge-amber'>📊 Feature Extraction</span>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "**Term Frequency** is the simplest way to turn text into numbers: "
+                "just count how often each word appears. This is exactly what the "
+                "**Keyword Extraction** Quick Tool already does — TF is the formal name "
+                "for that count. Everything in this module builds on it."
+            )
+            sample_doc = load_inaugural_corpus()[0]["text"][:2000]
+            st.info(f"Example: the opening of Washington's 1789 inaugural address (truncated).")
+
+            code = f'''from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from collections import Counter
+
+text = """{sample_doc[:150]}..."""
+tokens = word_tokenize(text.lower())
+stop_words = set(stopwords.words("english"))
+words = [t for t in tokens if t.isalpha() and t not in stop_words]
+
+tf = Counter(words)
+print(tf.most_common(10))'''
+
+            def show_tf():
+                stop_words = set(stopwords.words("english"))
+                tokens = word_tokenize(sample_doc.lower())
+                words = [t for t in tokens if t.isalpha() and t not in stop_words]
+                tf = Counter(words).most_common(10)
+                tf_df = pd.DataFrame(tf, columns=["Term", "Term Frequency (count)"])
+                st.dataframe(tf_df, use_container_width=True, hide_index=True)
+                st.bar_chart(tf_df.set_index("Term"))
+
+            code_and_output(code, show_tf, key="cc_tf")
+
+            st.info(
+                "💡 **The limitation TF-IDF fixes:** words like \"government\" or \"people\" "
+                "will top this list for almost *every* inaugural address — high TF doesn't "
+                "mean *distinctive*. The next lesson shows the fix."
+            )
+
+        # --- Lesson 1: TF-IDF (needs a corpus) ---
+        elif lesson_idx == 1:
+            st.subheader("TF-IDF — Term Frequency × Inverse Document Frequency")
+            st.markdown(
+                "<span class='badge badge-amber'>📊 Feature Extraction</span>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "TF-IDF downweights words that are common **across every document** and "
+                "upweights words that are frequent in *this* document but rare elsewhere. "
+                "It genuinely needs a corpus of multiple documents — computed on a single "
+                "document, the \"IDF\" half is constant and TF-IDF collapses to plain TF."
+            )
+
+            docs = load_inaugural_corpus()
+            labels = [d["label"] for d in docs]
+            pick = st.selectbox("Pick an inaugural address to inspect:", labels, index=labels.index("1861 Lincoln") if "1861 Lincoln" in labels else 0)
+            pick_idx = labels.index(pick)
+
+            code = '''from sklearn.feature_extraction.text import TfidfVectorizer
+
+# `speeches` = list of all 60 inaugural address texts
+vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+matrix = vec.fit_transform(speeches)
+
+terms = vec.get_feature_names_out()
+row = matrix[pick_idx].toarray().ravel()
+top10 = sorted(zip(terms, row), key=lambda x: -x[1])[:10]
+print(top10)'''
+
+            def show_tfidf():
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                texts = [d["text"] for d in docs]
+                vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+                matrix = vec.fit_transform(texts)
+                terms = vec.get_feature_names_out()
+                row = matrix[pick_idx].toarray().ravel()
+                top_idx = row.argsort()[::-1][:10]
+                top = [(terms[i], round(float(row[i]), 3)) for i in top_idx if row[i] > 0]
+                if top:
+                    df = pd.DataFrame(top, columns=["Term", "TF-IDF weight"])
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.bar_chart(df.set_index("Term"))
+                st.caption(
+                    f"💡 These are the terms that make **{pick}** distinctive *relative to "
+                    "all 59 other addresses* — notice they tend to be era- or "
+                    "speaker-specific, unlike the generic words TF alone surfaced."
+                )
+
+            code_and_output(code, show_tfidf, key="cc_tfidf")
+
+        # --- Lesson 2: Naive Bayes Classification ---
+        elif lesson_idx == 2:
+            st.subheader("Naive Bayes Classification")
+            st.markdown(
+                "<span class='badge badge-amber'>🧪 Classification</span>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "**Classification** predicts a label for new text, learned from labeled "
+                "examples. The Quick Tools version demonstrates this on 10 hand-labeled "
+                "movie reviews — good for seeing the mechanism, too small for a real "
+                "train/test split. Here we classify all **60 inaugural addresses** by "
+                "**era** (19th / 20th / 21st century) — a real label taken mechanically "
+                "from each speech's year, split into genuine train and test sets."
+            )
+
+            docs = load_inaugural_corpus()
+            texts = [d["text"] for d in docs]
+            eras = [d["era"] for d in docs]
+            era_counts = pd.Series(eras).value_counts()
+            st.caption(
+                "Class sizes: " + ", ".join(f"**{k}**: {v}" for k, v in era_counts.items())
+                + " — the 21st-century class is small because NLTK's corpus only goes "
+                "up to the most recent inauguration it was built with."
+            )
+
+            test_size = st.slider("Test set fraction", 0.15, 0.4, 0.25, 0.05, key="cc_test_size")
+
+            code = f'''from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# X = 60 speech texts, y = era labels ("19th century", "20th century", "21st century")
+X_train, X_test, y_train, y_test = train_test_split(
+    speeches, eras, test_size={test_size}, random_state=0, stratify=eras
+)
+
+vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+X_train_vec = vec.fit_transform(X_train)
+X_test_vec = vec.transform(X_test)
+
+clf = MultinomialNB()
+clf.fit(X_train_vec, y_train)
+preds = clf.predict(X_test_vec)
+print("Accuracy:", accuracy_score(y_test, preds))'''
+
+            def show_classification():
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.naive_bayes import MultinomialNB
+                from sklearn.model_selection import train_test_split
+                from sklearn.metrics import accuracy_score
+
+                X_train, X_test, y_train, y_test = train_test_split(
+                    texts, eras, test_size=test_size, random_state=0, stratify=eras
+                )
+                vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+                X_train_vec = vec.fit_transform(X_train)
+                X_test_vec = vec.transform(X_test)
+                clf = MultinomialNB()
+                clf.fit(X_train_vec, y_train)
+                preds = clf.predict(X_test_vec)
+                acc = accuracy_score(y_test, preds)
+
+                st.metric("Test accuracy", f"{acc:.0%}", help=f"Computed on {len(y_test)} held-out speeches")
+                result_df = pd.DataFrame({"Actual era": y_test, "Predicted era": preds})
+                st.dataframe(result_df, use_container_width=True, hide_index=True)
+                st.caption(
+                    f"💡 This is a **real, honestly computed** number on held-out data — "
+                    "not a claimed or expected result. Re-run with a different test "
+                    "fraction above and watch it change; with only 60 documents, accuracy "
+                    "is noisy from run to run."
+                )
+
+            code_and_output(code, show_classification, key="cc_classification")
+
+        # --- Lesson 3: K-Means Clustering ---
+        elif lesson_idx == 3:
+            st.subheader("K-Means Clustering")
+            st.markdown(
+                "<span class='badge badge-amber'>🔬 Clustering</span>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "**Clustering** groups documents by similarity **without using labels** — "
+                "the opposite setup from classification. We'll cluster the same 60 "
+                "inaugural addresses and then check, honestly, how well the *unsupervised* "
+                "clusters line up with the *real* eras from the previous lesson."
+            )
+
+            docs = load_inaugural_corpus()
+            texts = [d["text"] for d in docs]
+            eras = [d["era"] for d in docs]
+            labels_disp = [d["label"] for d in docs]
+            k = st.slider("Number of clusters (k)", 2, 6, 3, key="cc_cluster_k")
+
+            code = f'''from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+
+vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+X = vec.fit_transform(speeches)                 # 60 documents -> TF-IDF vectors
+km = KMeans(n_clusters={k}, n_init=10, random_state=0)
+cluster_labels = km.fit_predict(X)
+
+coords = PCA(n_components=2).fit_transform(X.toarray())  # for plotting only'''
+
+            def show_clustering_cc():
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.cluster import KMeans
+                from sklearn.decomposition import PCA
+
+                vec = TfidfVectorizer(stop_words="english", max_df=0.8)
+                X = vec.fit_transform(texts)
+                km = KMeans(n_clusters=k, n_init=10, random_state=0)
+                cluster_labels = km.fit_predict(X)
+                coords = PCA(n_components=2, random_state=0).fit_transform(X.toarray())
+
+                fig, ax = plt.subplots(figsize=(7, 5))
+                ax.scatter(coords[:, 0], coords[:, 1], c=cluster_labels, cmap="tab10", s=90, edgecolors="black")
+                ax.set_xlabel("PCA component 1")
+                ax.set_ylabel("PCA component 2")
+                ax.set_title(f"K-Means clusters of 60 inaugural addresses (k={k})")
+                st.pyplot(fig)
+                plt.close(fig)
+
+                st.markdown("**Does clustering (unsupervised) recover era (the real label)?**")
+                crosstab = pd.crosstab(
+                    pd.Series(cluster_labels, name="Cluster"),
+                    pd.Series(eras, name="Actual era"),
+                )
+                st.dataframe(crosstab, use_container_width=True)
+                st.caption(
+                    "💡 Read this like a confusion matrix. If a cluster's row is concentrated "
+                    "in one era column, K-Means found a grouping that lines up with real "
+                    "history using **only word similarity, no labels**. If it's spread across "
+                    "columns, clustering found some *other* structure (e.g. topic or length) "
+                    "that doesn't match era — an honest, possible outcome, not a failure to hide."
+                )
+
+            code_and_output(code, show_clustering_cc, key="cc_clustering")
+
+        lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
+
     # -----------------------------------------------------------------------
     # QUICK TOOLS (Python)
     # -----------------------------------------------------------------------
-
-            lesson_footer(track, lesson_idx, PY_TRACKS[track]["lessons"], f"nav_lesson_{track}")
-
     elif mode == "⚡ Quick Tools":
         st.header("Quick Tools")
         st.caption(
@@ -3006,7 +3422,9 @@ plt.show()'''
                 "enough to show *how* a classifier learns, nowhere near enough to be a "
                 "reliable real classifier. Production systems train on thousands to "
                 "millions of labeled examples. Treat every prediction below as a "
-                "demonstration, not a verdict."
+                "demonstration, not a verdict. For a version trained on a real 60-document "
+                "corpus with a genuine train/test split and honest accuracy, see "
+                "**🎓 Guided Learning → 🧪 Classification & Clustering**."
             )
 
             with st.expander("📋 The training data (10 reviews, hand-labeled)"):
@@ -3121,7 +3539,9 @@ print(dict(zip(clf.classes_, clf.predict_proba(X_new)[0])))'''
                 "Clustering groups similar texts **without labels** — the opposite setup from "
                 "Classification. Here we cluster the 10 sample reviews by TF-IDF similarity "
                 "using K-Means, then flatten the high-dimensional vectors to 2D with PCA so "
-                "they can actually be plotted."
+                "they can actually be plotted. For the same technique on a real 60-document "
+                "corpus — with a check against real historical eras — see "
+                "**🎓 Guided Learning → 🧪 Classification & Clustering**."
             )
 
             k = st.slider("Number of clusters (k)", min_value=2, max_value=4, value=2, key="clust_k")
