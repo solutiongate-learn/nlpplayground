@@ -190,9 +190,23 @@ CUSTOM_CSS = """
 
     /* Trim the overall top padding of the page — the default reserves
        noticeably more headroom above the first element than a page with a
-       hero banner (which already supplies its own visual top anchor) needs. */
+       hero banner (which already supplies its own visual top anchor) needs.
+
+       ALSO: even with layout="wide" set in st.set_page_config, Streamlit's
+       .block-container still caps out at a fixed max-width and centers
+       itself in the viewport — on a browser window wider than that cap
+       (common on any modern monitor), this leaves a large dead strip of
+       empty space on the right that has nothing to do with content amount,
+       just the container's own width ceiling. This is a well-documented
+       Streamlit behavior (see Streamlit community thread "Any way to expand
+       the display width?" and "Change main app width") with a standard,
+       widely-used fix: override max-width to actually use the full
+       available width. */
     .main .block-container {
         padding-top: 1.6rem;
+        max-width: 100%;
+        padding-left: 3rem;
+        padding-right: 3rem;
     }
 
     /* st.metric: denser by default (small label sitting far above a large
