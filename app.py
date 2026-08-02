@@ -370,6 +370,77 @@ def render_multi_doc_picker(key_prefix: str):
             st.error(f"Couldn't read {f.name}: {e}")
     return docs
 
+
+DOC_BOX_COUNT = 10
+
+
+def render_document_boxes(key_prefix: str):
+    """10 editable document boxes for TF/TF-IDF: each one is either pasted text
+    or an uploaded PDF, pre-filled with our 10 sample reviews as a replaceable
+    starting point. Nothing is (re-)analyzed until the Analyze button is
+    pressed — with 10 boxes, recomputing on every keystroke/blur would make
+    the page jump around constantly.
+
+    Returns the list of (label, text) pairs from the LAST time Analyze was
+    pressed (persisted across reruns), or None if it hasn't been pressed yet
+    this session. Shared key_prefix across lessons means whatever's filled in
+    on one lesson is still there when you move to the next.
+    """
+    st.caption(
+        f"Fill in up to {DOC_BOX_COUNT} documents below — type your own text or upload a "
+        "PDF per box. Pre-filled with our sample reviews as a starting point; replace "
+        "any or all of them. Nothing is analyzed until you press **Analyze** at the "
+        "bottom — editing 10 boxes shouldn't recompute anything on every keystroke."
+    )
+
+    defaults = SAMPLE_REVIEWS["review"].tolist()
+    box_texts = []
+    cols = st.columns(2)
+    for i in range(DOC_BOX_COUNT):
+        with cols[i % 2]:
+            with st.expander(f"📄 Document {i + 1}", expanded=(i < 2)):
+                input_mode = st.radio(
+                    "Input type", ["✍️ Type text", "📁 Upload PDF"],
+                    horizontal=True, key=f"{key_prefix}_mode_{i}",
+                    label_visibility="collapsed",
+                )
+                if input_mode == "📁 Upload PDF":
+                    up = st.file_uploader(
+                        "PDF", type=["pdf"], key=f"{key_prefix}_pdf_{i}",
+                        label_visibility="collapsed",
+                    )
+                    box_text = ""
+                    if up is not None:
+                        try:
+                            from pypdf import PdfReader
+                            reader = PdfReader(up)
+                            box_text = "\n".join(
+                                page.extract_text() or "" for page in reader.pages
+                            )[:MULTI_DOC_MAX_UPLOAD_CHARS]
+                        except Exception as e:
+                            st.error(f"Couldn't read this PDF: {e}")
+                else:
+                    default_text = defaults[i] if i < len(defaults) else ""
+                    box_text = st.text_area(
+                        "Text", value=default_text, height=100,
+                        key=f"{key_prefix}_text_{i}", label_visibility="collapsed",
+                    )
+                box_texts.append(box_text.strip())
+
+    non_empty = sum(1 for t in box_texts if t)
+    analyze = st.button(
+        f"🔄 Analyze ({non_empty} of {DOC_BOX_COUNT} documents have text)",
+        key=f"{key_prefix}_analyze", type="primary",
+    )
+
+    result_key = f"{key_prefix}_result"
+    if analyze:
+        st.session_state[result_key] = [
+            (f"Document {i + 1}", t) for i, t in enumerate(box_texts) if t
+        ]
+    return st.session_state.get(result_key)
+
+
 # Shared example sentences used across BOTH the NLTK and spaCy guided tracks,
 # so lessons that cover the same task (tokenization, stopwords, POS, NER) run
 # on identical input — differences you see are real library differences, not
@@ -383,11 +454,71 @@ def render_multi_doc_picker(key_prefix: str):
 # that turned out to belong to several real businesses — attributing invented
 # executives and financial figures to a real company name is a genuine risk,
 # so all placeholder names here are unambiguously non-real.
-SHARED_TEXT_TOKENS = "I don't think Example Corp's Q3 numbers were as strong as everyone's expecting."
-SHARED_TEXT_ENTITIES = (
+SHARED_TEXT_TOKENS_DEFAULT = "I don't think Example Corp's Q3 numbers were as strong as everyone's expecting."
+SHARED_TEXT_ENTITIES_DEFAULT = (
     "Dr. Jane Doe, the CFO of Example Corp, announced on Monday "
     "that the company will invest $2.5 million in its new Bengaluru office by March 2027."
 )
+
+
+def render_shared_text_editor():
+    """Editable, scrollable, persisted textboxes for the example text used by
+    every lesson in BOTH the NLTK and spaCy tracks. Returns the current
+    (possibly edited) (tokens_text, entities_text) pair.
+
+    Called at the top of each track's render block and reassigned onto the
+    SAME variable names (SHARED_TEXT_TOKENS / SHARED_TEXT_ENTITIES) that all
+    ~35 existing lesson call-sites already reference below — this is a flat,
+    top-level script (not wrapped in a function), so that reassignment flows
+    through automatically without touching any of those call sites.
+
+    Both tracks read from the SAME session-state keys, preserving the
+    deliberate invariant that NLTK vs spaCy differences are real library
+    differences, not an artifact of different input text.
+    """
+    # Pending-value pattern (same fix used for lesson prev/next): a widget's
+    # own key can't be reassigned after the widget is instantiated, so a Reset
+    # button must stash its target value and apply it BEFORE the text_area
+    # below is created on the next run.
+    for widget_key, default in (
+        ("shared_text_tokens_box", SHARED_TEXT_TOKENS_DEFAULT),
+        ("shared_text_entities_box", SHARED_TEXT_ENTITIES_DEFAULT),
+    ):
+        pending = st.session_state.pop(f"pending_{widget_key}", None)
+        if pending is not None:
+            st.session_state[widget_key] = pending
+        elif widget_key not in st.session_state:
+            st.session_state[widget_key] = default
+
+    with st.expander("✏️ Edit the shared example text (used by every lesson below)"):
+        st.caption(
+            "Both the NLTK and spaCy tracks use the **same** text for every lesson, so any "
+            "differences you see are genuine library differences — not caused by different "
+            "input. Edit here and it updates every lesson in both tracks; reset any time."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Tokens example** — Tokenization, Stopwords, Stemming/Lemmatization")
+            st.text_area(
+                "Tokens example", height=120, key="shared_text_tokens_box",
+                label_visibility="collapsed",
+            )
+            if st.button("🔄 Reset to default", key="reset_tokens_text"):
+                st.session_state["pending_shared_text_tokens_box"] = SHARED_TEXT_TOKENS_DEFAULT
+                st.rerun()
+        with c2:
+            st.markdown("**Entities example** — POS, NER, Sentiment, Keyword Extraction, Word Cloud, Dependency Parsing")
+            st.text_area(
+                "Entities example", height=120, key="shared_text_entities_box",
+                label_visibility="collapsed",
+            )
+            if st.button("🔄 Reset to default", key="reset_entities_text"):
+                st.session_state["pending_shared_text_entities_box"] = SHARED_TEXT_ENTITIES_DEFAULT
+                st.rerun()
+
+    tokens_val = st.session_state["shared_text_tokens_box"].strip() or SHARED_TEXT_TOKENS_DEFAULT
+    entities_val = st.session_state["shared_text_entities_box"].strip() or SHARED_TEXT_ENTITIES_DEFAULT
+    return tokens_val, entities_val
 
 # ---------------------------------------------------------------------------
 # QUICK TOOLS MAP — single source of truth, referenced by both the tool
@@ -1946,6 +2077,8 @@ except TypeError as e:
             unsafe_allow_html=True,
         )
 
+        SHARED_TEXT_TOKENS, SHARED_TEXT_ENTITIES = render_shared_text_editor()
+
 
         # --- NLTK Lesson 0: Tokenization ---
         if lesson_idx == 0:
@@ -2295,6 +2428,8 @@ plt.show()'''
             "as the <b>📚 NLTK</b> track for direct comparison.</div>",
             unsafe_allow_html=True,
         )
+
+        SHARED_TEXT_TOKENS, SHARED_TEXT_ENTITIES = render_shared_text_editor()
 
         nlp_spacy, spacy_ok = get_spacy_model()
         if not spacy_ok:
@@ -2738,37 +2873,48 @@ plt.show()'''
                 "**Keyword Extraction** Quick Tool already does — TF is the formal name "
                 "for that count. Everything in this module builds on it."
             )
-            sample_doc = load_inaugural_corpus()[0]["text"][:2000]
-            st.info(f"Example: the opening of Washington's 1789 inaugural address (truncated).")
 
-            code = f'''from nltk.tokenize import word_tokenize
+            docs_result = render_document_boxes(key_prefix="cc_docbox")
+
+            if not docs_result:
+                st.info("👆 Fill in the documents above (or keep the defaults) and press Analyze to see Term Frequency per document.")
+            else:
+                code = '''from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from collections import Counter
 
-text = """{sample_doc[:150]}..."""
-tokens = word_tokenize(text.lower())
 stop_words = set(stopwords.words("english"))
+tokens = word_tokenize(text.lower())
 words = [t for t in tokens if t.isalpha() and t not in stop_words]
 
 tf = Counter(words)
 print(tf.most_common(10))'''
 
-            def show_tf():
-                stop_words = set(stopwords.words("english"))
-                tokens = word_tokenize(sample_doc.lower())
-                words = [t for t in tokens if t.isalpha() and t not in stop_words]
-                tf = Counter(words).most_common(10)
-                tf_df = pd.DataFrame(tf, columns=["Term", "Term Frequency (count)"])
-                st.dataframe(tf_df, use_container_width=True, hide_index=True)
-                st.bar_chart(tf_df.set_index("Term"))
+                def show_tf():
+                    stop_words = set(stopwords.words("english"))
+                    pick = st.selectbox(
+                        "Show Term Frequency for:", [label for label, _ in docs_result],
+                        key="cc_tf_pick",
+                    )
+                    pick_text = dict(docs_result)[pick]
+                    tokens = word_tokenize(pick_text.lower())
+                    words = [t for t in tokens if t.isalpha() and t not in stop_words]
+                    tf = Counter(words).most_common(10)
+                    if tf:
+                        tf_df = pd.DataFrame(tf, columns=["Term", "Term Frequency (count)"])
+                        st.dataframe(tf_df, use_container_width=True, hide_index=True)
+                        st.bar_chart(tf_df.set_index("Term"))
+                    else:
+                        st.warning("No words left after removing stopwords — try a longer document.")
 
-            code_and_output(code, show_tf, key="cc_tf")
+                code_and_output(code, show_tf, key="cc_tf")
 
-            st.info(
-                "💡 **The limitation TF-IDF fixes:** words like \"government\" or \"people\" "
-                "will top this list for almost *every* inaugural address — high TF doesn't "
-                "mean *distinctive*. The next lesson shows the fix."
-            )
+                st.info(
+                    "💡 **The limitation TF-IDF fixes:** words like \"the\" or \"movie\" "
+                    "might top this list for *every* document in your set — high TF doesn't "
+                    "mean *distinctive*. The next lesson shows the fix, using these same "
+                    f"{len(docs_result)} documents."
+                )
 
         # --- Lesson 1: TF-IDF (needs a corpus) ---
         elif lesson_idx == 1:
@@ -2784,42 +2930,56 @@ print(tf.most_common(10))'''
                 "document, the \"IDF\" half is constant and TF-IDF collapses to plain TF."
             )
 
-            docs = load_inaugural_corpus()
-            labels = [d["label"] for d in docs]
-            pick = st.selectbox("Pick an inaugural address to inspect:", labels, index=labels.index("1861 Lincoln") if "1861 Lincoln" in labels else 0)
-            pick_idx = labels.index(pick)
+            docs_result = render_document_boxes(key_prefix="cc_docbox")
 
-            code = '''from sklearn.feature_extraction.text import TfidfVectorizer
+            if not docs_result:
+                st.info("👆 Fill in the documents above (or keep the defaults) and press Analyze to see TF-IDF across your set.")
+            elif len(docs_result) < 2:
+                st.warning(
+                    "TF-IDF needs **at least 2 documents** to mean anything — only "
+                    f"{len(docs_result)} document has text. Fill in another box and re-Analyze."
+                )
+            else:
+                labels = [label for label, _ in docs_result]
+                pick = st.selectbox("Show TF-IDF for:", labels, key="cc_tfidf_pick")
+                pick_idx = labels.index(pick)
 
-# `speeches` = list of all 60 inaugural address texts
+                code = '''from sklearn.feature_extraction.text import TfidfVectorizer
+
+# `documents` = your list of document texts
 vec = TfidfVectorizer(stop_words="english", max_df=0.8)
-matrix = vec.fit_transform(speeches)
+matrix = vec.fit_transform(documents)
 
 terms = vec.get_feature_names_out()
 row = matrix[pick_idx].toarray().ravel()
 top10 = sorted(zip(terms, row), key=lambda x: -x[1])[:10]
 print(top10)'''
 
-            def show_tfidf():
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                texts = [d["text"] for d in docs]
-                vec = TfidfVectorizer(stop_words="english", max_df=0.8)
-                matrix = vec.fit_transform(texts)
-                terms = vec.get_feature_names_out()
-                row = matrix[pick_idx].toarray().ravel()
-                top_idx = row.argsort()[::-1][:10]
-                top = [(terms[i], round(float(row[i]), 3)) for i in top_idx if row[i] > 0]
-                if top:
-                    df = pd.DataFrame(top, columns=["Term", "TF-IDF weight"])
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                    st.bar_chart(df.set_index("Term"))
-                st.caption(
-                    f"💡 These are the terms that make **{pick}** distinctive *relative to "
-                    "all 59 other addresses* — notice they tend to be era- or "
-                    "speaker-specific, unlike the generic words TF alone surfaced."
-                )
+                def show_tfidf():
+                    from sklearn.feature_extraction.text import TfidfVectorizer
+                    texts = [t for _, t in docs_result]
+                    vec = TfidfVectorizer(stop_words="english", max_df=0.9)
+                    matrix = vec.fit_transform(texts)
+                    terms = vec.get_feature_names_out()
+                    row = matrix[pick_idx].toarray().ravel()
+                    top_idx = row.argsort()[::-1][:10]
+                    top = [(terms[i], round(float(row[i]), 3)) for i in top_idx if row[i] > 0]
+                    if top:
+                        df = pd.DataFrame(top, columns=["Term", "TF-IDF weight"])
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        st.bar_chart(df.set_index("Term"))
+                    else:
+                        st.info(
+                            "Every word in this document either doesn't appear elsewhere "
+                            "in the vocabulary or was filtered — try more varied documents."
+                        )
+                    st.caption(
+                        f"💡 These are the terms that make **{pick}** distinctive *relative "
+                        f"to the other {len(docs_result) - 1} document(s) you provided* — "
+                        "swap in your own documents above and re-Analyze to see this change."
+                    )
 
-            code_and_output(code, show_tfidf, key="cc_tfidf")
+                code_and_output(code, show_tfidf, key="cc_tfidf")
 
         # --- Lesson 2: Naive Bayes Classification ---
         elif lesson_idx == 2:
@@ -2828,6 +2988,75 @@ print(top10)'''
                 "<span class='badge badge-amber'>🧪 Classification</span>",
                 unsafe_allow_html=True,
             )
+            st.markdown(
+                "**Classification** predicts a label for new examples, learned from past "
+                "examples with known labels. That idea has nothing to do with text — it "
+                "works on plain numbers first. Part 1 below classifies numbers; Part 2 "
+                "applies the exact same idea to text, where the only extra step is turning "
+                "words into numbers first (TF-IDF, from the previous lesson)."
+            )
+
+            st.markdown("#### Part 1 — Classification on plain numbers")
+            st.caption(
+                "Synthetic teaching data — hours studied and practice tests taken, "
+                "predicting pass/fail. Not real student records."
+            )
+
+            study_data = pd.DataFrame({
+                "hours_studied": [1, 2, 2, 3, 4, 4, 5, 6, 7, 8, 8, 9],
+                "practice_tests": [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4],
+                "result": ["Fail", "Fail", "Fail", "Fail", "Fail", "Pass",
+                           "Pass", "Pass", "Pass", "Pass", "Pass", "Pass"],
+            })
+            st.dataframe(study_data, use_container_width=True, hide_index=True)
+
+            code_numeric = '''from sklearn.naive_bayes import GaussianNB
+import pandas as pd
+
+# Numeric features -> use GaussianNB, not MultinomialNB (that's for counts/text, Part 2)
+X = data[["hours_studied", "practice_tests"]]
+y = data["result"]
+
+clf = GaussianNB()
+clf.fit(X, y)
+
+new_student = [[5, 1]]  # 5 hours studied, 1 practice test
+print(clf.predict(new_student))
+print(clf.predict_proba(new_student))'''
+
+            def show_numeric_classification():
+                from sklearn.naive_bayes import GaussianNB
+                X = study_data[["hours_studied", "practice_tests"]]
+                y = study_data["result"]
+                clf = GaussianNB()
+                clf.fit(X, y)
+
+                c1, c2 = st.columns(2)
+                new_hours = c1.slider("New student: hours studied", 0, 10, 5, key="cc_new_hours")
+                new_tests = c2.slider("New student: practice tests taken", 0, 5, 1, key="cc_new_tests")
+                new_student = pd.DataFrame(
+                    {"hours_studied": [new_hours], "practice_tests": [new_tests]}
+                )
+                pred = clf.predict(new_student)[0]
+                proba = clf.predict_proba(new_student)[0]
+
+                fig, ax = plt.subplots(figsize=(6, 4))
+                colors = study_data["result"].map({"Pass": "tab:green", "Fail": "tab:red"})
+                ax.scatter(study_data["hours_studied"], study_data["practice_tests"], c=colors, s=100, edgecolors="black", label="Training data")
+                ax.scatter([new_hours], [new_tests], c="blue", s=200, marker="*", edgecolors="black", label="New student")
+                ax.set_xlabel("Hours studied")
+                ax.set_ylabel("Practice tests taken")
+                ax.legend()
+                st.pyplot(fig)
+                plt.close(fig)
+
+                st.metric("Predicted result", pred)
+                st.caption(f"💡 Probability: {dict(zip(clf.classes_, proba.round(2)))}")
+
+            code_and_output(code_numeric, show_numeric_classification, key="cc_numeric_classification")
+
+            st.markdown("<div class='lib-section'></div>", unsafe_allow_html=True)
+            st.markdown("#### Part 2 — The same idea, applied to text")
             st.markdown(
                 "**Classification** predicts a label for new text, learned from labeled "
                 "examples. The Quick Tools version demonstrates this on 10 hand-labeled "
@@ -2905,10 +3134,61 @@ print("Accuracy:", accuracy_score(y_test, preds))'''
                 unsafe_allow_html=True,
             )
             st.markdown(
-                "**Clustering** groups documents by similarity **without using labels** — "
-                "the opposite setup from classification. We'll cluster the same 60 "
-                "inaugural addresses and then check, honestly, how well the *unsupervised* "
-                "clusters line up with the *real* eras from the previous lesson."
+                "**Clustering** groups things by similarity **without using labels** — "
+                "the opposite setup from classification. Like Classification, this idea "
+                "has nothing to do with text at first. Part 1 clusters plain 2D points; "
+                "Part 2 applies the same K-Means algorithm to text, where the only extra "
+                "step is TF-IDF turning words into numbers first."
+            )
+
+            st.markdown("#### Part 1 — Clustering plain numbers")
+            st.caption("Synthetic 2D points, deliberately arranged into visually obvious groups.")
+
+            import numpy as np
+            rng = np.random.RandomState(42)
+            group_a = rng.normal(loc=[2, 2], scale=0.6, size=(8, 2))
+            group_b = rng.normal(loc=[8, 3], scale=0.6, size=(8, 2))
+            group_c = rng.normal(loc=[5, 8], scale=0.6, size=(8, 2))
+            points = np.vstack([group_a, group_b, group_c])
+            points_df = pd.DataFrame(points, columns=["x", "y"])
+
+            k_numeric = st.slider("Number of clusters (k)", 2, 5, 3, key="cc_numeric_k")
+
+            code_numeric_cl = f'''from sklearn.cluster import KMeans
+
+# `points` = array of (x, y) coordinates, no labels
+km = KMeans(n_clusters={k_numeric}, n_init=10, random_state=0)
+cluster_labels = km.fit_predict(points)
+print(cluster_labels)'''
+
+            def show_numeric_clustering():
+                from sklearn.cluster import KMeans
+                km_num = KMeans(n_clusters=k_numeric, n_init=10, random_state=0)
+                labels_num = km_num.fit_predict(points_df[["x", "y"]])
+
+                fig, ax = plt.subplots(figsize=(6, 5))
+                ax.scatter(points_df["x"], points_df["y"], c=labels_num, cmap="tab10", s=110, edgecolors="black")
+                centers = km_num.cluster_centers_
+                ax.scatter(centers[:, 0], centers[:, 1], c="black", s=200, marker="X", label="Cluster centers")
+                ax.set_xlabel("x")
+                ax.set_ylabel("y")
+                ax.legend()
+                st.pyplot(fig)
+                plt.close(fig)
+                st.caption(
+                    "💡 With no labels at all, K-Means found groups purely from how close "
+                    "points are to each other. This is exactly what happens to TF-IDF "
+                    "vectors in Part 2 — just in many more than 2 dimensions."
+                )
+
+            code_and_output(code_numeric_cl, show_numeric_clustering, key="cc_numeric_clustering")
+
+            st.markdown("<div class='lib-section'></div>", unsafe_allow_html=True)
+            st.markdown("#### Part 2 — The same idea, applied to text")
+            st.markdown(
+                "We'll cluster the same 60 inaugural addresses and then check, honestly, "
+                "how well the *unsupervised* clusters line up with the *real* eras from "
+                "the previous lesson."
             )
 
             docs = load_inaugural_corpus()
