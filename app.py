@@ -264,6 +264,23 @@ SHARED_TEXT_ENTITIES = (
 )
 
 # ---------------------------------------------------------------------------
+# QUICK TOOLS MAP — single source of truth, referenced by both the tool
+# selectbox and the Start Here overview's "Interactive tools" count. Keeping
+# these in one place after a hardcoded count (4) silently went stale the
+# moment Word Cloud, Classification, and Clustering were added — three new
+# tools shipped and the landing page kept advertising the old number.
+# ---------------------------------------------------------------------------
+QUICK_TOOLS = [
+    "🔧 Preprocessing Pipeline",
+    "😊 Sentiment Analysis",
+    "🔑 Keyword Extraction",
+    "🏷️ Named Entity Recognition",
+    "☁️ Word Cloud",
+    "🧪 Classification",
+    "🔬 Clustering",
+]
+
+# ---------------------------------------------------------------------------
 # CURRICULUM MAP — single source of truth for navigation.
 #
 # Lessons used to live inside st.tabs(). That was replaced because tab strips
@@ -334,7 +351,7 @@ def render_overview():
     c1, c2, c3 = st.columns(3)
     c1.metric("Python lessons", TOTAL_PY_LESSONS)
     c2.metric("Modules", len(PY_TRACKS))
-    c3.metric("Interactive tools", 4)
+    c3.metric("Interactive tools", len(QUICK_TOOLS))
 
     st.markdown("### 🐍 The Python path")
     steps = [
@@ -373,7 +390,7 @@ def render_overview():
             st.caption(
                 "Load your own text — paste, upload a .txt/.csv/.pdf, or pick a "
                 "public-domain classic — then run sentiment, keywords, entity "
-                "recognition and a step-by-step preprocessing pipeline on it. "
+                "recognition, word clouds, classification, or clustering on it. "
                 "NLTK and spaCy results shown side by side."
             )
             if st.button("Open Quick Tools →", key="overview_start_quicktools", use_container_width=True):
@@ -2441,18 +2458,7 @@ for token in doc:
 
         st.markdown("---")
 
-        tool = st.selectbox(
-            "Choose a tool",
-            [
-                "🔧 Preprocessing Pipeline",
-                "😊 Sentiment Analysis",
-                "🔑 Keyword Extraction",
-                "🏷️ Named Entity Recognition",
-                "☁️ Word Cloud",
-                "🧪 Classification",
-                "🔬 Clustering",
-            ],
-        )
+        tool = st.selectbox("Choose a tool", QUICK_TOOLS)
 
         st.markdown("---")
 
