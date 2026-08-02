@@ -788,6 +788,27 @@ def code_and_output_r(code: str, render_output, key: str):
         render_output()
 
 
+def render_r_practice_box(key: str, placeholder: str):
+    """An editable scratchpad for practicing R syntax, honestly labeled.
+
+    This app has no R runtime — there's no way to actually execute whatever
+    gets typed here. A box that looked responsive without being responsive
+    would be dishonest UI, so this is explicit: it's for practicing syntax by
+    typing it out, not for seeing your own input actually run. The output
+    shown elsewhere on the lesson is always the fixed, verified example.
+    """
+    st.text_area(
+        "✏️ Practice writing R code here",
+        value=placeholder, height=100, key=key,
+    )
+    st.caption(
+        "ℹ️ This box doesn't execute — this app runs on Python, so there's no R "
+        "interpreter here to run what you type. Use it to practice R syntax by writing "
+        "it out; paste into RStudio, Posit Cloud, or an online R environment to see it "
+        "actually run. The output above/below stays the verified example regardless."
+    )
+
+
 def render_entities(doc, key: str = ""):
     """Visualise named entities inline using spaCy's built-in displaCy renderer.
 
@@ -1128,7 +1149,10 @@ print(word * 2)            # strings support repetition, not math!'''
                     "- `.split()` with no argument splits on any whitespace — spaces, tabs, newlines."
                 )
 
-            user_string = st.text_input("Type any sentence:", "NLPPlayground makes learning NLP fun")
+            user_string = st.text_area(
+                "Type any sentence:", "NLPPlayground makes learning NLP fun",
+                height=100, key="lesson2_strings_input",
+            )
 
             code = f'''# Setup: none needed — uses Python's built-in string methods, no installs required.
 s = "{user_string}"
@@ -1180,7 +1204,10 @@ print(s[::-1])         # reverse the string'''
                     "`key=len` tells Python what to compare by."
                 )
 
-            items_raw = st.text_input("Enter a few words, comma-separated:", "python, nlp, data, ai, learning")
+            items_raw = st.text_area(
+                "Enter a few words, comma-separated:", "python, nlp, data, ai, learning",
+                height=100, key="lesson3_lists_input",
+            )
             items = [i.strip() for i in items_raw.split(",") if i.strip()]
 
             code = f'''# Setup: none needed — uses Python's built-in list/loop syntax, no installs required.
@@ -1360,9 +1387,10 @@ print(result)'''
                     "to preserve insertion order — don't rely on dict order the way you would a list."
                 )
 
-            sentence_input = st.text_input(
+            sentence_input = st.text_area(
                 "Type a sentence to count word frequency:",
                 "the cat sat on the mat",
+                height=100, key="lesson6_dict_input",
             )
 
             code = f'''# Setup: none needed — uses Python's built-in dict, no installs required.
@@ -4239,6 +4267,10 @@ cat("Hello,", name, "- welcome to NLPPlayground!\\n")'''
                 st.caption("💡 `cat()` concatenates and prints text — one of the most common R output functions.")
 
             code_and_output_r(code, show_r_intro, key="r_lesson0_intro")
+            render_r_practice_box(
+                key="r_practice_0",
+                placeholder='name <- "Your name here"\ncat("Hello,", name, "\\n")',
+            )
 
 
         # --- Lesson 1: Variables & Data Types ---
@@ -4293,6 +4325,10 @@ print(paste(word, word))    # "sentiment sentiment"'''
                 )
 
             code_and_output_r(code, show_r_types, key="r_lesson1_types")
+            render_r_practice_box(
+                key="r_practice_1",
+                placeholder='my_number <- 42\nmy_word <- "hello"\nprint(class(my_number))\nprint(class(my_word))',
+            )
 
 
         # --- Lesson 2: Strings & Text ---
@@ -4344,6 +4380,10 @@ paste(rev(strsplit(s, "")[[1]]), collapse = "")  # reverse the string'''
                 )
 
             code_and_output_r(code, show_r_strings, key="r_lesson2_strings")
+            render_r_practice_box(
+                key="r_practice_2",
+                placeholder='s <- "Type your own sentence here"\nprint(nchar(s))\nprint(toupper(s))',
+            )
 
 
         # --- Lesson 3: Vectors & Loops ---
@@ -4398,6 +4438,10 @@ cat("Longest word:", longest, "\\n")'''
                 )
 
             code_and_output_r(code, show_r_vectors, key="r_lesson3_vectors")
+            render_r_practice_box(
+                key="r_practice_3",
+                placeholder='words <- c("python", "nlp", "data")\nfor (w in words) {\n  print(w)\n}',
+            )
 
 
         # --- Lesson 4: Conditionals ---
@@ -4449,6 +4493,10 @@ print(label)'''
                 st.caption("💡 Example uses a fixed score of 0.3 — copy the code and change the value to see other labels.")
 
             code_and_output_r(code, show_r_conditional, key="r_lesson4_conditionals")
+            render_r_practice_box(
+                key="r_practice_4",
+                placeholder='score <- 0.3\nif (score > 0.1) {\n  label <- "Positive"\n} else {\n  label <- "Neutral"\n}\nprint(label)',
+            )
 
 
         # --- Lesson 5: Functions ---
@@ -4500,6 +4548,10 @@ print(result)'''
                 st.code("wow this product is amazing totally worth it", language="text")
 
             code_and_output_r(code, show_r_functions, key="r_lesson5_functions")
+            render_r_practice_box(
+                key="r_practice_5",
+                placeholder='square <- function(x) {\n  return(x * x)\n}\nprint(square(5))',
+            )
 
 
         # --- Lesson 6: Named Lists ---
@@ -4556,6 +4608,10 @@ cat("Count of the:", word_counts[["the"]], "\\n")'''
                 )
 
             code_and_output_r(code, show_r_namedlist, key="r_lesson6_namedlists")
+            render_r_practice_box(
+                key="r_practice_6",
+                placeholder='scores <- list(good = 1, bad = -1, neutral = 0)\nprint(scores$good)',
+            )
 
 
         # --- Lesson 7: Data Frames ---
@@ -4613,6 +4669,10 @@ print(df[order(-df$length), ])'''
                 )
 
             code_and_output_r(code, show_r_dataframe, key="r_lesson7_dataframes")
+            render_r_practice_box(
+                key="r_practice_7",
+                placeholder='df <- data.frame(word = c("cat", "dog"), count = c(3, 5))\nprint(df)',
+            )
 
 
     # -----------------------------------------------------------------------
