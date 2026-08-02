@@ -440,6 +440,7 @@ PY_TRACKS = {
         "lessons": [
             "0️⃣ Tokenization", "1️⃣ Stopwords", "2️⃣ Stemming",
             "3️⃣ POS Tagging", "4️⃣ NER", "5️⃣ Sentiment (VADER)",
+            "6️⃣ Keyword Extraction", "7️⃣ Word Cloud",
         ],
     },
     "⚡ spaCy": {
@@ -448,6 +449,7 @@ PY_TRACKS = {
         "lessons": [
             "0️⃣ Tokenization", "1️⃣ Stopwords", "2️⃣ Lemmatization",
             "3️⃣ POS Tagging", "4️⃣ NER", "5️⃣ Dependency Parsing",
+            "6️⃣ Sentiment", "7️⃣ Keyword Extraction", "8️⃣ Word Cloud",
         ],
     },
     "🧪 Classification & Clustering": {
@@ -2175,6 +2177,100 @@ print(sia.polarity_scores(text))'''
 
             code_and_output(code, show_nltk_vader, key="nltk_lesson5_vader")
 
+        # --- NLTK Lesson 6: Keyword Extraction (TF) ---
+        # Promoted from Quick Tools into a taught lesson — this was previously
+        # only runnable, never explained step by step in Guided Learning.
+        if lesson_idx == 6:
+            st.subheader("Keyword Extraction")
+            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown(
+                "The simplest form of **keyword extraction** is counting word frequency "
+                "after removing stopwords — this is **Term Frequency (TF)**, the same "
+                "concept taught more formally in the 🧪 Classification & Clustering module. "
+                "Here's the NLTK version on our shared example sentence."
+            )
+            st.info(f"Shared example sentence: *\"{SHARED_TEXT_ENTITIES}\"*")
+
+            code = f'''# Setup (run once, e.g. in Colab):
+# import nltk
+# nltk.download("punkt"); nltk.download("punkt_tab"); nltk.download("stopwords")
+
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from collections import Counter
+
+text = "{SHARED_TEXT_ENTITIES}"
+stop_words = set(stopwords.words("english"))
+tokens = word_tokenize(text.lower())
+keywords = [t for t in tokens if t.isalpha() and t not in stop_words]
+
+print(Counter(keywords).most_common(10))'''
+
+            def show_nltk_keywords():
+                stop_words = set(stopwords.words("english"))
+                tokens = word_tokenize(SHARED_TEXT_ENTITIES.lower())
+                keywords = [t for t in tokens if t.isalpha() and t not in stop_words]
+                freq = Counter(keywords).most_common(10)
+                if freq:
+                    kw_df = pd.DataFrame(freq, columns=["Keyword", "Frequency"])
+                    st.dataframe(kw_df, use_container_width=True, hide_index=True)
+                    st.bar_chart(kw_df.set_index("Keyword"))
+                else:
+                    st.warning("No keywords found.")
+
+            code_and_output(code, show_nltk_keywords, key="nltk_lesson6_keywords")
+
+            st.caption(
+                "💡 Try the **🔧 Quick Tools → 🔑 Keyword Extraction** tool to run this on "
+                "your own text, with NLTK and spaCy shown side by side."
+            )
+
+        # --- NLTK Lesson 7: Word Cloud ---
+        if lesson_idx == 7:
+            st.subheader("Word Cloud")
+            st.markdown("<span class='badge badge-nltk'>📚 NLTK</span>", unsafe_allow_html=True)
+            st.markdown(
+                "A word cloud is a **visualization** of exactly the keyword frequencies "
+                "from the previous lesson — same numbers, sized by frequency instead of "
+                "listed in a table. It adds no new NLP technique; it's a picture of one "
+                "you've already learned."
+            )
+
+            code = f'''# Setup: pip install wordcloud matplotlib
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from collections import Counter
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+
+text = "{SHARED_TEXT_ENTITIES}"
+stop_words = set(stopwords.words("english"))
+tokens = word_tokenize(text.lower())
+words = [t for t in tokens if t.isalpha() and t not in stop_words]
+freq = dict(Counter(words))
+
+wc = WordCloud(width=800, height=400, background_color="white").generate_from_frequencies(freq)
+plt.imshow(wc, interpolation="bilinear")
+plt.axis("off")
+plt.show()'''
+
+            def show_nltk_wordcloud():
+                stop_words = set(stopwords.words("english"))
+                tokens = word_tokenize(SHARED_TEXT_ENTITIES.lower())
+                words = [t for t in tokens if t.isalpha() and t not in stop_words]
+                freq = dict(Counter(words))
+                if not freq:
+                    st.warning("No words left to plot.")
+                    return
+                wc = WordCloud(width=800, height=400, background_color="white", colormap="viridis").generate_from_frequencies(freq)
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.imshow(wc, interpolation="bilinear")
+                ax.axis("off")
+                st.pyplot(fig)
+                plt.close(fig)
+
+            code_and_output(code, show_nltk_wordcloud, key="nltk_lesson7_wordcloud")
+
             if st.button("✓ NLTK track complete", key="nltk_done"):
                 st.success("Nice work! Try the ⚡ spaCy track next to see the same tasks with a model-based library →")
 
@@ -2462,6 +2558,147 @@ for token in doc:
                     "rows of text genuinely obscure — follow any arrow back to `ROOT`."
                 )
                 render_dependency_tree(nlp_spacy(SHARED_TEXT_ENTITIES), key="viz_lesson_dep")
+
+            # --- spaCy Lesson 6: Sentiment (lexicon-based) ---
+            # NLTK's track has a Sentiment lesson (VADER); spaCy has none built in.
+            # Added here so both tracks stay symmetric for direct comparison —
+            # same honest caveat already established in the Quick Tools version.
+            if lesson_idx == 6:
+                st.subheader("Sentiment (Lexicon-based)")
+                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.caption(
+                    "ℹ️ **Note:** spaCy has **no built-in sentiment analysis** — that's a "
+                    "genuine, structural difference from NLTK (which ships VADER), not "
+                    "something skipped here. This lesson uses spaCy for tokenization and "
+                    "lemmatization plus a small illustrative lexicon, so every number is "
+                    "verifiable — not a spaCy built-in feature."
+                )
+
+                sample_text_sp = st.text_input(
+                    "Try your own sentence:",
+                    "The customer service team really impressed me, though the checkout page was confusing.",
+                    key="spacy_sentiment_input",
+                )
+
+                code = f'''# Setup (run once, e.g. in Colab):
+# !pip install spacy
+# !python -m spacy download en_core_web_sm
+
+import spacy
+nlp = spacy.load("en_core_web_sm")
+
+text = "{sample_text_sp}"
+doc = nlp(text)
+
+positive_words = {{"love", "great", "excellent", "clean", "easy", "amazing", "best", "impressed"}}
+negative_words = {{"terrible", "bad", "worst", "hate", "confusing", "boring"}}
+
+pos_count = sum(1 for t in doc if t.lemma_.lower() in positive_words)
+neg_count = sum(1 for t in doc if t.lemma_.lower() in negative_words)
+print("Positive:", pos_count, "| Negative:", neg_count)'''
+
+                def show_spacy_sentiment_lesson():
+                    if not sample_text_sp.strip():
+                        st.warning("Enter a sentence above.")
+                        return
+                    doc = nlp_spacy(sample_text_sp)
+                    positive_words = {"love", "great", "excellent", "clean", "easy", "amazing", "best", "impressed"}
+                    negative_words = {"terrible", "bad", "worst", "hate", "confusing", "boring"}
+                    pos_count = sum(1 for t in doc if t.lemma_.lower() in positive_words)
+                    neg_count = sum(1 for t in doc if t.lemma_.lower() in negative_words)
+                    label = "Positive 😊" if pos_count > neg_count else "Negative 😞" if neg_count > pos_count else "Neutral 😐"
+                    st.metric("Overall", label)
+                    c1, c2 = st.columns(2)
+                    c1.metric("Positive words", pos_count)
+                    c2.metric("Negative words", neg_count)
+                    st.caption("💡 spaCy's `.lemma_` reduces words to their base form before matching — \"impressed\" and \"impressing\" would match the same lexicon entry.")
+
+                code_and_output(code, show_spacy_sentiment_lesson, key="spacy_lesson6_sentiment")
+
+            # --- spaCy Lesson 7: Keyword Extraction ---
+            if lesson_idx == 7:
+                st.subheader("Keyword Extraction")
+                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown(
+                    "Same **Term Frequency** idea as the NLTK track's Keyword Extraction "
+                    "lesson, but using spaCy's `.lemma_` (base form) instead of NLTK's raw "
+                    "tokens — \"runs\" and \"running\" collapse into one count here."
+                )
+                st.info(f"Shared example sentence: *\"{SHARED_TEXT_ENTITIES}\"*")
+
+                code = f'''# Setup (run once, e.g. in Colab):
+# !pip install spacy
+# !python -m spacy download en_core_web_sm
+
+import spacy
+from collections import Counter
+
+nlp = spacy.load("en_core_web_sm")
+text = "{SHARED_TEXT_ENTITIES}"
+doc = nlp(text)
+
+keywords = [t.lemma_.lower() for t in doc if not t.is_stop and t.is_alpha]
+print(Counter(keywords).most_common(10))'''
+
+                def show_spacy_keywords():
+                    doc = nlp_spacy(SHARED_TEXT_ENTITIES)
+                    keywords = [t.lemma_.lower() for t in doc if not t.is_stop and t.is_alpha]
+                    freq = Counter(keywords).most_common(10)
+                    if freq:
+                        kw_df = pd.DataFrame(freq, columns=["Keyword (lemma)", "Frequency"])
+                        st.dataframe(kw_df, use_container_width=True, hide_index=True)
+                        st.bar_chart(kw_df.set_index("Keyword (lemma)"))
+                    else:
+                        st.warning("No keywords found.")
+
+                code_and_output(code, show_spacy_keywords, key="spacy_lesson7_keywords")
+
+                st.caption(
+                    "💡 Try the **🔧 Quick Tools → 🔑 Keyword Extraction** tool to run this on "
+                    "your own text, with NLTK and spaCy shown side by side."
+                )
+
+            # --- spaCy Lesson 8: Word Cloud ---
+            if lesson_idx == 8:
+                st.subheader("Word Cloud")
+                st.markdown("<span class='badge badge-spacy'>⚡ spaCy</span>", unsafe_allow_html=True)
+                st.markdown(
+                    "A visualization of the previous lesson's lemma frequencies — same "
+                    "numbers, sized by frequency instead of listed in a table."
+                )
+
+                code = f'''# Setup: pip install wordcloud matplotlib
+import spacy
+from collections import Counter
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+
+nlp = spacy.load("en_core_web_sm")
+text = "{SHARED_TEXT_ENTITIES}"
+doc = nlp(text)
+words = [t.lemma_.lower() for t in doc if not t.is_stop and t.is_alpha]
+freq = dict(Counter(words))
+
+wc = WordCloud(width=800, height=400, background_color="white").generate_from_frequencies(freq)
+plt.imshow(wc, interpolation="bilinear")
+plt.axis("off")
+plt.show()'''
+
+                def show_spacy_wordcloud():
+                    doc = nlp_spacy(SHARED_TEXT_ENTITIES)
+                    words = [t.lemma_.lower() for t in doc if not t.is_stop and t.is_alpha]
+                    freq = dict(Counter(words))
+                    if not freq:
+                        st.warning("No words left to plot.")
+                        return
+                    wc = WordCloud(width=800, height=400, background_color="white", colormap="viridis").generate_from_frequencies(freq)
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    ax.imshow(wc, interpolation="bilinear")
+                    ax.axis("off")
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                code_and_output(code, show_spacy_wordcloud, key="spacy_lesson8_wordcloud")
 
                 if st.button("✓ spaCy track complete", key="spacy_done"):
                     st.success("Great work — you've now seen the same NLP tasks through both a classic (NLTK) and modern (spaCy) lens.")
@@ -3066,7 +3303,10 @@ print(top10)'''
 
         # ===================== SENTIMENT ANALYSIS =====================
         elif tool == "😊 Sentiment Analysis":
-
+            st.caption(
+                "🎓 New to sentiment analysis? See **Guided Learning → 📚 NLTK / ⚡ spaCy → "
+                "Sentiment** for a step-by-step explanation first."
+            )
             st.markdown(
                 "<span class='badge badge-nltk'>📚 NLTK path</span>",
                 unsafe_allow_html=True,
@@ -3154,7 +3394,10 @@ print("Positive:", pos_count, "| Negative:", neg_count)'''
 
         # ===================== KEYWORD EXTRACTION =====================
         elif tool == "🔑 Keyword Extraction":
-
+            st.caption(
+                "🎓 New to keyword extraction? See **Guided Learning → 📚 NLTK / ⚡ spaCy → "
+                "Keyword Extraction** for a step-by-step explanation first."
+            )
             st.markdown(
                 "<span class='badge badge-nltk'>📚 NLTK path</span>",
                 unsafe_allow_html=True,
@@ -3312,6 +3555,10 @@ for ent in doc.ents:
 
         # ===================== WORD CLOUD =====================
         elif tool == "☁️ Word Cloud":
+            st.caption(
+                "🎓 See **Guided Learning → 📚 NLTK / ⚡ spaCy → Word Cloud** for the same "
+                "tool explained as a taught lesson first."
+            )
             st.markdown(
                 "A word cloud sizes each word by how often it appears — a quick visual gut-check "
                 "of what a text is about. It's built on the **same word-frequency counting** as "
